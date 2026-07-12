@@ -44,6 +44,7 @@ LANG_BY_EXT = {
     ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp",
     ".hpp": "cpp", ".hh": "cpp", ".hxx": "cpp", ".inl": "cpp",
     ".idl": "idl",
+    ".fidl": "idl",  # Franca IDL(SOME/IP 계열) — interface 이름 추출 목적
 }
 
 DEFAULT_EXCLUDES = [
@@ -583,6 +584,7 @@ def cmd_index(root: Path, only_files=None):
             n_edge += 1
     if show_progress:
         print(file=sys.stderr)
+    n_bind = _link_boundaries(root, cur)
     con.commit()
 
     head = run_git(root, "rev-parse", "--short", "HEAD")
@@ -594,10 +596,64 @@ def cmd_index(root: Path, only_files=None):
     state_p.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
     scope = f"{len(targets)}개 파일(부분)" if only_files else f"{len(targets)}개 파일(전체)"
+    if n_bind:
+        scope += f", 경계 연결 {n_bind}개"
     print(f"색인 완료: {scope}, 심볼 {n_sym}개, 관계 {n_edge}개"
           f"{' [ctags]' if has_universal_ctags() else ' [내장 스캐너]'}")
     if head:
         print(f"기준 커밋: {head}")
+
+def _link_boundaries(root: Path, cur):
+    """언어 경계 연결(미들웨어 중립). IDL/Franca 정의 파일과 코드 파일을
+    (a) 파일 이름 줄기(rtiddsgen 등 생성 코드는 원본 이름을 물려받는 관례),
+    (b) 인터페이스 이름 언급으로 잇는다. 전부 추정(inferred) 등급.
+    RTI DDS / CycloneDDS / zenoh-pico / SOME-IP(Franca) 공통으로 동작."""
+    idl_rows = cur.execute("SELECT path FROM files WHERE lang='idl'").fetchall()
+    if not idl_rows:
+        return 0
+    cur.execute("DELETE FROM edges WHERE kind IN ('binds','generated_from')")
+    stems = {Path(ip).stem: ip for (ip,) in idl_rows if len(Path(ip).stem) >= 4}
+    names = {}
+    for name, ipath in cur.execute(
+            "SELECT s.name, f.path FROM symbols s JOIN files f ON f.id=s.file_id "
+            "WHERE f.lang='idl' AND s.kind IN "
+            "('idl_interface','idl_struct','idl_module') AND length(s.name)>=4"):
+        names.setdefault(name, set()).add(ipath)
+    # 프로젝트 내에서 유일하게 정의된 이름만 사용 (동명이인 방지)
+    names = {n: ps.pop() for n, ps in names.items()
+             if len(ps) == 1 and n not in CALL_NOISE}
+    name_rx = None
+    if names:
+        alt = "|".join(re.escape(n) for n in
+                       sorted(names, key=len, reverse=True))
+        name_rx = re.compile(rf"\b({alt})\b")
+    n_edges = 0
+    for (path, lang) in cur.execute(
+            "SELECT path, lang FROM files WHERE lang!='idl'").fetchall():
+        base = Path(path).stem
+        for stem, ipath in stems.items():
+            if base == stem or base.startswith(stem):
+                cur.execute(
+                    "INSERT INTO edges(src_file,src_symbol,dst_name,dst_file,"
+                    "kind,provenance,confidence) VALUES(?,?,?,?,?,?,?)",
+                    (path, None, stem, ipath, "generated_from",
+                     "stem-match", "inferred"))
+                n_edges += 1
+        if name_rx is None:
+            continue
+        try:
+            text = read_source(root / path)[1]
+        except Exception:
+            continue
+        hit_names = {m.group(1) for m in name_rx.finditer(text)}
+        for n in sorted(hit_names):
+            cur.execute(
+                "INSERT INTO edges(src_file,src_symbol,dst_name,dst_file,"
+                "kind,provenance,confidence) VALUES(?,?,?,?,?,?,?)",
+                (path, None, n, names[n], "binds", "name-match", "inferred"))
+            n_edges += 1
+    return n_edges
+
 
 # ---------------------------------------------------------------- stubs
 
@@ -657,13 +713,85 @@ def cmd_stubs(root: Path):
                 else:
                     body.append(f"- `{dst_name}` (외부 또는 미해석)\n")
             body.append("\n")
+        bounds = cur.execute(
+            "SELECT src_file, dst_name, dst_file, kind FROM edges "
+            "WHERE (src_file=? OR dst_file=?) AND kind IN "
+            "('binds','generated_from') ORDER BY kind, src_file",
+            (path, path)).fetchall()
+        if bounds:
+            body.append("## 언어 경계 연결 (이름 기반 추정)\n\n")
+            for src, dname, dfile, kind in bounds[:20]:
+                if src == path and kind == "generated_from":
+                    body.append(f"- [[{stub_rel(dfile)[:-3]}|{dfile}]] 에서 "
+                                f"생성된 코드로 보임\n")
+                elif src == path:
+                    body.append(f"- `{dname}` ([[{stub_rel(dfile)[:-3]}|{dfile}]]"
+                                f") 을 참조하는 것으로 보임\n")
+                else:
+                    body.append(f"- [[{stub_rel(src)[:-3]}|{src}]] 가 이 파일의 "
+                                f"`{dname}` 를 참조하는 것으로 보임\n")
+            body.append("\n")
         body.append("## 참고\n\n- 이 목록에 없는 관계(동적 호출, 함수 포인터, "
                     "DI 등)는 '없는 것'이 아니라 '기계가 확인 못 한 것'입니다.\n")
         out.write_text("".join(body), encoding="utf-8")
     if show_progress:
         print(file=sys.stderr)
     _write_index(root, cur)
-    print(f"stub 생성 완료: wiki/files/ 아래 {len(files)}개 + INDEX.md")
+    _write_module_map(root, cur)
+    print(f"stub 생성 완료: wiki/files/ 아래 {len(files)}개 + INDEX.md "
+          f"+ module-map.md")
+
+
+def _module_depth(paths):
+    """최상위 폴더가 3개 이하면(모든 코드가 src/ 밑 등) 한 단계 더 세분화."""
+    tops = {p.split("/")[0] for p in paths if "/" in p}
+    return 2 if len(tops) <= 3 else 1
+
+
+def _module_of(path, depth):
+    parts = path.split("/")
+    if len(parts) > depth:
+        return "/".join(parts[:depth])
+    return "/".join(parts[:-1]) or "(root)"
+
+
+def _write_module_map(root: Path, cur):
+    """모듈(폴더) 사이 의존 그래프를 mermaid로 자동 생성 — 낡지 않는 조감도."""
+    paths = [r[0] for r in cur.execute("SELECT path FROM files")]
+    if not paths:
+        return
+    depth = _module_depth(paths)
+    agg = {}
+    for src, dst, kind in cur.execute(
+            "SELECT src_file, dst_file, kind FROM edges "
+            "WHERE dst_file IS NOT NULL AND kind IN "
+            "('includes','imports','binds','generated_from')"):
+        ms, md = _module_of(src, depth), _module_of(dst, depth)
+        if ms == md:
+            continue
+        boundary = kind in ("binds", "generated_from")
+        agg[(ms, md, boundary)] = agg.get((ms, md, boundary), 0) + 1
+
+    def nid(m):
+        return re.sub(r"\W", "_", m)
+
+    lines = ["---\ntype: module-map\ngenerated: true\n---\n",
+             "> ⚙️ 자동 생성 — 편집 금지. `cw.py stubs` 때마다 다시 그려집니다.\n\n",
+             "# 모듈 관계 지도\n\n",
+             "화살표 = 참조 방향(A→B: A가 B를 사용). 숫자 = 참조 건수. "
+             "실선 = include/import, 점선 = 언어 경계(추정).\n\n",
+             "```mermaid\nflowchart LR\n"]
+    mods = sorted({m for (a, b, _) in agg for m in (a, b)})
+    for m in mods:
+        lines.append(f'    {nid(m)}["{m}"]\n')
+    for (a, b, boundary), c in sorted(agg.items(), key=lambda x: -x[1])[:60]:
+        arrow = "-.->" if boundary else "-->"
+        lines.append(f'    {nid(a)} {arrow}|{c}| {nid(b)}\n')
+    lines.append("```\n")
+    if not agg:
+        lines.append("\n(모듈 사이 참조가 아직 색인되지 않았습니다.)\n")
+    (root / "wiki" / "module-map.md").write_text("".join(lines),
+                                                 encoding="utf-8")
 
 
 def _fan_in(cur):
@@ -867,7 +995,7 @@ def cmd_lint(root: Path):
                         warns.append(f"{rel}:{line_no} {msg}")
 
         # 2) 프론트매터 필수 필드 (modules/flows/contracts/overview)
-        if dtype in ("module", "flow", "contract", "overview"):
+        if dtype in ("module", "flow", "contract", "overview", "note"):
             for field in ("validated_at", "depends"):
                 if field not in fm or not fm[field]:
                     errors.append(f"{rel} 프론트매터에 {field}가 없음")
@@ -1045,6 +1173,62 @@ def cmd_status(root: Path):
     ndocs = len(list(wiki_docs(root))) if (root / "wiki").exists() else 0
     print(f"위키 문서(스텁 제외): {ndocs}개")
 
+# ---------------------------------------------------------------- coverage
+
+def cmd_coverage(root: Path):
+    """위키가 코드의 어디를 다루고 어디가 비었는지 — '다음에 뭘 문서화할지'를
+    감이 아니라 데이터로 정하게 해준다."""
+    con = open_db(root)
+    cur = con.cursor()
+    docs = []
+    if (root / "wiki").exists():
+        for doc in wiki_docs(root):
+            fm, _ = parse_frontmatter(
+                doc.read_text(encoding="utf-8", errors="replace"))
+            if fm.get("type") in ("module", "flow", "note", "contract"):
+                deps = fm.get("depends", [])
+                if isinstance(deps, str):
+                    deps = [deps]
+                if deps:
+                    docs.append((str(doc.relative_to(root)), deps))
+    files = [r[0] for r in cur.execute("SELECT path FROM files")]
+    covered = set()
+    for f in files:
+        for _dname, deps in docs:
+            if any(fnmatch.fnmatch(f, d) for d in deps):
+                covered.add(f)
+                break
+    total = len(files)
+    pct = 100 * len(covered) // max(total, 1)
+    print(f"# 위키 커버리지\n")
+    print(f"전체: {len(covered)}/{total} 파일 ({pct}%) — "
+          f"depends를 가진 문서 {len(docs)}개 기준\n")
+
+    depth = _module_depth(files)
+    mods = {}
+    for f in files:
+        m = _module_of(f, depth)
+        tot, cov = mods.get(m, (0, 0))
+        mods[m] = (tot + 1, cov + (1 if f in covered else 0))
+    print("## 모듈별\n")
+    for m in sorted(mods, key=lambda k: mods[k][1] / mods[k][0]):
+        tot, cov = mods[m]
+        bar = "■" * (10 * cov // tot) + "□" * (10 - 10 * cov // tot)
+        print(f"- {bar} {m}/  {cov}/{tot}")
+
+    fan = cur.execute(
+        "SELECT dst_file, COUNT(*) c FROM edges WHERE dst_file IS NOT NULL "
+        "GROUP BY dst_file ORDER BY c DESC").fetchall()
+    gaps = [(p, c) for p, c in fan if p not in covered][:15]
+    if gaps:
+        print("\n## 문서가 없는 중요 파일 (참조 많은 순 — 다음 문서화 후보)\n")
+        for p, c in gaps:
+            print(f"- {p}  ← {c}개 파일이 참조하는데 다루는 문서 없음")
+    if not docs:
+        print("\n(depends를 가진 위키 문서가 아직 없습니다 — "
+              "모듈/흐름 문서를 먼저 생성하세요.)")
+
+
 # ---------------------------------------------------------------- context
 
 def cmd_context(root: Path, query: str):
@@ -1196,7 +1380,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["setup", "init", "index", "stubs",
                                         "map", "lint", "update", "status",
-                                        "doctor", "context"])
+                                        "doctor", "context", "coverage"])
     ap.add_argument("path", nargs="?", default=".",
                     help="대상 프로젝트 루트 (기본: 현재 디렉터리)")
     ap.add_argument("query", nargs="?",
@@ -1232,6 +1416,8 @@ def main():
         cmd_status(root)
     elif args.command == "doctor":
         cmd_doctor(root)
+    elif args.command == "coverage":
+        cmd_coverage(root)
     elif args.command == "context":
         if args.query is None:
             # `cw.py context 심볼` 형태: path 자리에 온 것이 질의어

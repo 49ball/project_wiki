@@ -1,6 +1,6 @@
 ---
 name: codewiki
-description: Use when the user asks to create, update, verify, or explore a project knowledge wiki generated from source code — triggers include 코드 위키, 프로젝트 위키 생성/갱신, 온보딩 문서 만들기, "위키가 낡았다", stale wiki, cw.py, codewiki, or code changes that need wiki sync
+description: Use when the user asks to create, update, verify, or explore a project knowledge wiki generated from source code, or wants knowledge remembered in it — triggers include 코드 위키, 프로젝트 위키 생성/갱신, 온보딩 문서, "위키가 낡았다", stale wiki, cw.py, codewiki, "기억해둬", "위키에 남겨줘", or finishing a work session in a repo that has wiki/
 ---
 
 # codewiki — 코드 프로젝트 지식 위키 도구
@@ -29,6 +29,7 @@ Obsidian 호환 위키를 만들고 증분 갱신하는 로컬 CLI다.
 | `$CW update <proj>` | git diff로 stale 문서 탐지 + 부분 재색인 |
 | `$CW update <proj> --mark-done` | 위키 동기화 완료를 현재 커밋으로 기록 |
 | `$CW context <proj> <심볼>` | 심볼의 정의·호출자·호출 대상·관련 문서 조립 — 코드 수정 작업 전에 실행하면 좋음 |
+| `$CW coverage <proj>` | 위키 커버리지 + 다음 문서화 후보 (사용자가 "뭘 더 문서화할까" 물으면) |
 
 ## 워크플로우 (요청별)
 
@@ -42,6 +43,9 @@ Obsidian 호환 위키를 만들고 증분 갱신하는 로컬 CLI다.
   `~/codewiki/prompts/2-update.md` 절차를 따르라.
   끝나면 `lint` 통과 확인 후 `update --mark-done`.
 - **위키 감사/검증 요청**: `~/codewiki/prompts/3-verify.md` 절차를 따르라.
+- **지식 캡처** (사용자가 "기억해둬/위키에 남겨줘"라고 하거나, 코드 작업
+  세션을 마무리할 때): `~/codewiki/prompts/4-capture.md` 절차를 따르라 —
+  이번 작업에서 알게 된 코드에 없는 지식을 notes/decisions/glossary에 남긴다.
 
 ## 절대 규칙 (프롬프트 파일과 동일)
 
