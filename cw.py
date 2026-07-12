@@ -23,6 +23,7 @@ codewiki (cw.py) — 코드 프로젝트용 AI Wiki 툴킷의 결정론적 부�
 
 import argparse
 import ast
+import bisect
 import fnmatch
 import hashlib
 import json
@@ -187,37 +188,184 @@ def parse_python(path: Path, text: str):
 RE_INCLUDE = re.compile(r'^\s*#\s*include\s*[<"]([^">]+)[">]', re.M)
 RE_CLASS = re.compile(r'^\s*(?:template\s*<[^>]*>\s*)?(class|struct)\s+(\w+)'
                       r'(?![^{;\n]*;)', re.M)
-# 함수 정의 휴리스틱: 반환타입류 + 이름( ... ) {
-# 백트래킹 폭발 방지: 무제한 \s(개행 포함) 스캔을 금지하고,
-# 개행은 (a) 인자 목록 안(길이 제한), (b) 여는 중괄호 직전 1회만 허용.
-RE_FUNC = re.compile(
-    r'^(?![ \t]*(?:if|for|while|switch|return|else|do|case|catch|new|delete)\b)'
-    r'[ \t]*(?:[\w:<>\*&~, \t]+?[ \t\*&])?'
-    r'((?:\w+::)*[~\w]+)[ \t]*\(([^;{}]{0,400}?)\)[ \t]*'
-    r'(?:const[ \t]*)?(?:noexcept[ \t]*)?(?:override[ \t]*)?'
-    r'(?:\r?\n[ \t]*)?\{',
+# ---- C/C++ 스캐너 (정규식 휴리스틱 대체) ----------------------------------
+# 방식: 주석·문자열·전처리 줄을 공백으로 지운 뒤(줄 번호 보존),
+# 모든 '{'에 대해 바로 앞이 "이름(인자들)" 형태인지 뒤로 검사한다.
+# 정규식 대비 개선: 여러 줄 시그니처, 생성자 초기화 리스트, 함수 끝 라인,
+# 주석/문자열 속 가짜 코드 오탐 제거. 여전히 못 하는 것: 매크로 전개,
+# 템플릿 인스턴스 해석, operator 오버로드 일부.
+
+C_STRIP_RE = re.compile(
+    r'R"([^(\n]{0,16})\([\s\S]*?\)\1"'        # C++11 raw string
+    r'|//[^\n]*'                              # 줄 주석
+    r'|/\*[\s\S]*?\*/'                        # 블록 주석
+    r'|"(?:\\.|[^"\\\n])*"'                   # 문자열
+    r"|'(?:\\.|[^'\\\n])*'"                   # 문자
+    r'|^[ \t]*#[^\n]*(?:\\\n[^\n]*)*',        # 전처리 지시문(#define의 { 방지)
     re.M)
-KEYWORD_BLACKLIST = {"if", "for", "while", "switch", "sizeof", "catch",
-                     "return", "defined", "assert"}
+
+CTRL_KEYWORDS = {"if", "for", "while", "switch", "return", "else", "do",
+                 "case", "catch", "sizeof", "new", "delete", "defined",
+                 "assert", "constexpr", "requires", "alignas", "decltype",
+                 "alignof", "static_assert", "typeid"}
+TRAILER_WORDS = {"const", "noexcept", "override", "final", "mutable",
+                 "volatile", "throw", "try"}
+
+
+def _blank_keep_newlines(m):
+    return "".join(c if c == "\n" else " " for c in m.group(0))
+
+
+def _match_back(s, i, close_ch, open_ch, limit_chars=6000):
+    """s[i]==close_ch에서 짝이 되는 open_ch 인덱스. 실패/한도 초과 시 -1."""
+    depth = 0
+    limit = max(0, i - limit_chars)
+    while i >= limit:
+        c = s[i]
+        if c == close_ch:
+            depth += 1
+        elif c == open_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+        i -= 1
+    return -1
+
+
+def _ident_back(s, i):
+    """s[i]에서 뒤로 (한정 가능한) 식별자 읽기 → (name, name_start_index)."""
+    j = i
+    while j >= 0:
+        c = s[j]
+        if c.isalnum() or c in "_~":
+            j -= 1
+        elif c == ":" and j >= 1 and s[j - 1] == ":":
+            j -= 2
+        else:
+            break
+    return s[j + 1:i + 1], j + 1
+
+
+def _is_access_colon(s, k):
+    """s[k]==':' 가 public:/private:/protected: 의 콜론인지."""
+    if k < 1:
+        return False
+    word, _ = _ident_back(s, k - 1)
+    return word in ("public", "private", "protected")
+
+
+def _sig_before_brace(s, brace_pos):
+    """'{' 직전이 함수 시그니처면 (name, name_pos, sig) 반환, 아니면 None."""
+    i = brace_pos - 1
+    for _ in range(40):  # 초기화 리스트 멤버 수 상한
+        while i >= 0 and s[i].isspace():
+            i -= 1
+        if i < 0:
+            return None
+        c = s[i]
+        if c == ")":
+            op = _match_back(s, i, ")", "(")
+            if op < 0:
+                return None
+            j = op - 1
+            while j >= 0 and s[j].isspace():
+                j -= 1
+            if j < 0:
+                return None
+            name, ns = _ident_back(s, j)
+            if not name:
+                return None  # 람다 `](){...}`, 캐스팅 등
+            base = name.split("::")[-1].lstrip("~")
+            if base in TRAILER_WORDS:  # noexcept(...) 같은 꼬리 그룹
+                i = ns - 1
+                continue
+            if base in CTRL_KEYWORDS:
+                return None
+            # 생성자 초기화 리스트 항목( `: a_(1), b_(2)` )이면 더 뒤로.
+            # 단 `public:` 등 접근 지정자의 콜론은 초기화 리스트가 아니다.
+            k = ns - 1
+            while k >= 0 and s[k].isspace():
+                k -= 1
+            if k >= 0 and (s[k] == "," or
+                           (s[k] == ":" and (k == 0 or s[k - 1] != ":")
+                            and not _is_access_colon(s, k))):
+                i = k - 1
+                continue
+            sig = re.sub(r"\s+", " ", s[ns:i + 1]).strip()
+            return name, ns, sig[:120]
+        if c == "}":  # 초기화 리스트의 brace-init `count_{0}` 건너뛰기
+            op = _match_back(s, i, "}", "{")
+            if op < 0:
+                return None
+            i = op - 1
+            continue
+        if c.isalnum() or c == "_":
+            name, ns = _ident_back(s, i)
+            if name in TRAILER_WORDS:
+                i = ns - 1
+                continue
+            if name.split("::")[-1] in CTRL_KEYWORDS:
+                return None  # `return {};` 등
+            arrow = s.rfind("->", max(0, ns - 200), ns)
+            if arrow >= 0:  # 후행 반환 타입 `-> std::vector<int>`
+                i = arrow - 1
+                continue
+            # 초기화 리스트의 brace-init 멤버 이름( `count_{0}` 의 count_ )
+            k = ns - 1
+            while k >= 0 and s[k].isspace():
+                k -= 1
+            if k >= 0 and (s[k] == "," or
+                           (s[k] == ":" and (k == 0 or s[k - 1] != ":"))):
+                i = k - 1
+                continue
+            return None
+        if c in ">&*:":
+            arrow = s.rfind("->", max(0, i - 200), i)
+            if arrow >= 0:
+                i = arrow - 1
+                continue
+            return None
+        return None
+    return None
+
+
+def _find_functions(stripped):
+    nl = [m.start() for m in re.finditer("\n", stripped)]
+
+    def line_of(pos):
+        return bisect.bisect_left(nl, pos) + 1
+
+    stack, pairs = [], {}
+    for m in re.finditer(r"[{}]", stripped):
+        if m.group() == "{":
+            stack.append(m.start())
+        elif stack:
+            pairs[stack.pop()] = m.start()
+    out, seen = [], set()
+    for p in sorted(pairs):
+        hit = _sig_before_brace(stripped, p)
+        if hit:
+            name, ns, sig = hit
+            if ns in seen:  # 초기화 리스트의 brace-init 등 내부 '{' 중복 방지
+                continue
+            seen.add(ns)
+            out.append((name, "function", sig,
+                        line_of(ns), line_of(pairs[p]), "scanner"))
+    return out
 
 
 def parse_c_cpp(path: Path, text: str):
-    """정규식 휴리스틱 — 놓치는 것이 있을 수 있고(멀티라인 시그니처, 매크로),
-    provenance='regex'로 그 사실을 기록한다. universal-ctags가 있으면 대체됨."""
+    """스캐너 휴리스틱 — 컴파일하지 않으므로 매크로 전개·템플릿 해석은 못 하고,
+    그 사실을 provenance='scanner'로 기록한다. universal-ctags가 있으면 대체됨."""
     symbols, edges = [], []
-    for m in RE_INCLUDE.finditer(text):
+    for m in RE_INCLUDE.finditer(text):  # 전처리 줄은 원본에서 추출
         edges.append((None, m.group(1), None, "includes", "regex", "confirmed"))
-    for m in RE_CLASS.finditer(text):
-        line = text.count("\n", 0, m.start()) + 1
+    stripped = C_STRIP_RE.sub(_blank_keep_newlines, text)
+    for m in RE_CLASS.finditer(stripped):
+        line = stripped.count("\n", 0, m.start()) + 1
         symbols.append((m.group(2), m.group(1), m.group(0).strip()[:120],
-                        line, line, "regex"))
-    for m in RE_FUNC.finditer(text):
-        name = m.group(1)
-        if name.split("::")[-1] in KEYWORD_BLACKLIST:
-            continue
-        line = text.count("\n", 0, m.start(1)) + 1
-        sig = f"{name}({m.group(2).strip()[:80]})"
-        symbols.append((name, "function", sig, line, line, "regex"))
+                        line, line, "scanner"))
+    symbols += _find_functions(stripped)
     return symbols, edges
 
 
@@ -409,7 +557,7 @@ def cmd_index(root: Path, only_files=None):
 
     scope = f"{len(targets)}개 파일(부분)" if only_files else f"{len(targets)}개 파일(전체)"
     print(f"색인 완료: {scope}, 심볼 {n_sym}개, 관계 {n_edge}개"
-          f"{' [ctags]' if has_universal_ctags() else ' [regex — universal-ctags 설치 시 C/C++ 정밀도 향상]'}")
+          f"{' [ctags]' if has_universal_ctags() else ' [내장 스캐너]'}")
     if head:
         print(f"기준 커밋: {head}")
 
