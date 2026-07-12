@@ -187,12 +187,15 @@ def parse_python(path: Path, text: str):
 RE_INCLUDE = re.compile(r'^\s*#\s*include\s*[<"]([^">]+)[">]', re.M)
 RE_CLASS = re.compile(r'^\s*(?:template\s*<[^>]*>\s*)?(class|struct)\s+(\w+)'
                       r'(?![^{;\n]*;)', re.M)
-# 함수 정의 휴리스틱: 반환타입류 + 이름( ... ) { — 한 줄 시그니처만 잡음.
+# 함수 정의 휴리스틱: 반환타입류 + 이름( ... ) {
+# 백트래킹 폭발 방지: 무제한 \s(개행 포함) 스캔을 금지하고,
+# 개행은 (a) 인자 목록 안(길이 제한), (b) 여는 중괄호 직전 1회만 허용.
 RE_FUNC = re.compile(
-    r'^(?!\s*(?:if|for|while|switch|return|else|do|case|catch|new|delete)\b)'
-    r'[ \t]*(?:[\w:<>\*&~,\s]+?[\s\*&])?'
-    r'((?:\w+::)*[~\w]+)\s*\(([^;{}]*)\)\s*'
-    r'(?:const\s*)?(?:noexcept\s*)?(?:override\s*)?\{',
+    r'^(?![ \t]*(?:if|for|while|switch|return|else|do|case|catch|new|delete)\b)'
+    r'[ \t]*(?:[\w:<>\*&~, \t]+?[ \t\*&])?'
+    r'((?:\w+::)*[~\w]+)[ \t]*\(([^;{}]{0,400}?)\)[ \t]*'
+    r'(?:const[ \t]*)?(?:noexcept[ \t]*)?(?:override[ \t]*)?'
+    r'(?:\r?\n[ \t]*)?\{',
     re.M)
 KEYWORD_BLACKLIST = {"if", "for", "while", "switch", "sizeof", "catch",
                      "return", "defined", "assert"}
