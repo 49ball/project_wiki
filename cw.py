@@ -63,6 +63,18 @@ def sha_of(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()[:12]
 
 
+def read_source(p: Path):
+    """소스 파일 읽기. UTF-8 → CP949(한국어 레거시) → latin-1 순서로 시도.
+    반환: (raw bytes, 디코딩된 text, 사용된 인코딩)"""
+    raw = p.read_bytes()
+    for enc in ("utf-8", "cp949", "latin-1"):
+        try:
+            return raw, raw.decode(enc), enc
+        except UnicodeDecodeError:
+            continue
+    return raw, raw.decode("utf-8", errors="replace"), "utf-8(replace)"
+
+
 def run_git(root: Path, *args):
     """git 명령 실행. git 저장소가 아니거나 실패하면 None."""
     try:
@@ -135,6 +147,8 @@ CREATE TABLE IF NOT EXISTS edges(
 CREATE INDEX IF NOT EXISTS idx_sym_file ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_edge_src ON edges(src_file);
 CREATE INDEX IF NOT EXISTS idx_edge_dst ON edges(dst_file);
+CREATE INDEX IF NOT EXISTS idx_edge_dstname ON edges(dst_name);
+CREATE INDEX IF NOT EXISTS idx_sym_name ON symbols(name);
 """
 
 # ---------------------------------------------------------------- 파서들
@@ -329,6 +343,14 @@ def _sig_before_brace(s, brace_pos):
     return None
 
 
+CALL_RE = re.compile(r"\b([A-Za-z_]\w{1,63})\s*\(")
+CALL_NOISE = CTRL_KEYWORDS | TRAILER_WORDS | {
+    "int", "char", "float", "double", "void", "bool", "long", "short",
+    "unsigned", "signed", "auto", "size_t", "template", "operator",
+    "static_cast", "dynamic_cast", "reinterpret_cast", "const_cast"}
+MAX_CALLS_PER_FUNC = 32
+
+
 def _find_functions(stripped):
     nl = [m.start() for m in re.finditer("\n", stripped)]
 
@@ -341,7 +363,7 @@ def _find_functions(stripped):
             stack.append(m.start())
         elif stack:
             pairs[stack.pop()] = m.start()
-    out, seen = [], set()
+    out, calls, seen = [], [], set()
     for p in sorted(pairs):
         hit = _sig_before_brace(stripped, p)
         if hit:
@@ -351,7 +373,21 @@ def _find_functions(stripped):
             seen.add(ns)
             out.append((name, "function", sig,
                         line_of(ns), line_of(pairs[p]), "scanner"))
-    return out
+            # 본문 속 호출 후보: `이름(` 패턴 — 어느 심볼로 가는지는 미해석
+            body = stripped[p:pairs[p]]
+            base = name.split("::")[-1]
+            found = set()
+            for cm in CALL_RE.finditer(body):
+                callee = cm.group(1)
+                if callee in CALL_NOISE or callee == base:
+                    continue
+                found.add(callee)
+                if len(found) >= MAX_CALLS_PER_FUNC:
+                    break
+            for callee in sorted(found):
+                calls.append((name, callee, None, "calls",
+                              "scanner", "inferred"))
+    return out, calls
 
 
 def parse_c_cpp(path: Path, text: str):
@@ -365,7 +401,9 @@ def parse_c_cpp(path: Path, text: str):
         line = stripped.count("\n", 0, m.start()) + 1
         symbols.append((m.group(2), m.group(1), m.group(0).strip()[:120],
                         line, line, "scanner"))
-    symbols += _find_functions(stripped)
+    funcs, calls = _find_functions(stripped)
+    symbols += funcs
+    edges += calls
     return symbols, edges
 
 
@@ -485,13 +523,14 @@ def cmd_index(root: Path, only_files=None):
     all_paths = [p for p in iter_source_files(root, cfg)]
     files_by_name = {}
     for p in all_paths:
-        rel = str(p.relative_to(root))
+        rel = p.relative_to(root).as_posix()
         files_by_name.setdefault(p.name, []).append(rel)
 
     targets = all_paths
     if only_files is not None:
         wanted = set(only_files)
-        targets = [p for p in all_paths if str(p.relative_to(root)) in wanted]
+        targets = [p for p in all_paths
+                   if p.relative_to(root).as_posix() in wanted]
         # 삭제된 파일 정리
         for f in only_files:
             if not (root / f).exists():
@@ -507,13 +546,12 @@ def cmd_index(root: Path, only_files=None):
     n_sym = n_edge = 0
     show_progress = sys.stderr.isatty() and len(targets) > 10
     for i, p in enumerate(targets, 1):
-        rel = str(p.relative_to(root))
+        rel = p.relative_to(root).as_posix()
         if show_progress and (i % 10 == 0 or i == len(targets)):
             print(f"\r색인 중... {i}/{len(targets)}  {rel[:60]:<60}",
                   end="", file=sys.stderr, flush=True)
         try:
-            raw = p.read_bytes()
-            text = raw.decode("utf-8", errors="replace")
+            raw, text, _enc = read_source(p)
         except Exception:
             continue
         lang = LANG_BY_EXT[p.suffix.lower()]
@@ -687,6 +725,14 @@ def cmd_map(root: Path):
     out.append("\n## 변경 파급이 큰 파일 (fan-in 상위)\n\n")
     for path, c in _fan_in(cur):
         out.append(f"- {path}  ← {c}개 파일이 참조\n")
+    called = cur.execute(
+        "SELECT dst_name, COUNT(DISTINCT src_file) c FROM edges "
+        "WHERE kind='calls' GROUP BY dst_name "
+        "HAVING c >= 2 ORDER BY c DESC LIMIT 10").fetchall()
+    if called:
+        out.append("\n## 여러 파일에서 호출되는 함수 상위 (이름 기반 추정)\n\n")
+        for name, c in called:
+            out.append(f"- `{name}()`  ← {c}개 파일에서 호출\n")
     out.append("\n## 엔트리포인트 후보\n\n")
     entries = []
     rows = cur.execute(
@@ -698,8 +744,7 @@ def cmd_map(root: Path):
     py_mains = cur.execute("SELECT path FROM files WHERE lang='python'").fetchall()
     for (path,) in py_mains:
         try:
-            if "__main__" in (root / path).read_text(encoding="utf-8",
-                                                     errors="replace"):
+            if "__main__" in read_source(root / path)[1]:
                 entries.append(f"- {path}  `if __name__ == '__main__'`\n")
         except Exception:
             pass
@@ -948,12 +993,33 @@ def cmd_init(root: Path, show_next=True):
             copied.append(str(rel))
     cw_dir = root / ".codewiki"
     cw_dir.mkdir(exist_ok=True)
+    gi = cw_dir / ".gitignore"
+    if not gi.exists():  # facts.db 등 도구 데이터가 커밋되지 않게
+        gi.write_text("*\n", encoding="utf-8")
     cfg_p = cw_dir / "config.json"
     if not cfg_p.exists():
         cfg_p.write_text(json.dumps(
             {"exclude_dirs": DEFAULT_EXCLUDES,
              "_설명": "exclude_dirs: 색인에서 제외할 디렉터리 패턴"},
             indent=2, ensure_ascii=False), encoding="utf-8")
+    # 이 저장소에서 작업하는 AI 에이전트가 위키를 자동으로 알게 하는 안내 파일
+    agent_note = (
+        "# 프로젝트 지식 위키 안내 (AI 에이전트용)\n\n"
+        "이 저장소에는 codewiki가 관리하는 지식층이 있다. 작업 전에 활용하라:\n\n"
+        "- 전체 구조: `wiki/00-overview.md` → 상세: `wiki/modules/`, `wiki/flows/`\n"
+        "- 프로젝트 지도: `.codewiki/map.md` (모듈 후보·핵심 파일·엔트리포인트)\n"
+        "- 특정 심볼/파일 작업 전: `python3 <codewiki>/cw.py context . <심볼이름>`\n"
+        "- 위키 수정 시 규칙: `wiki/conventions.md` (라벨·anchor 필수)\n"
+        "- 코드 변경 후: `python3 <codewiki>/cw.py update .` 로 낡은 문서 확인·갱신\n"
+    )
+    for fname in ("CLAUDE.md", "AGENTS.md"):
+        p = root / fname
+        if not p.exists():
+            p.write_text(agent_note, encoding="utf-8")
+            print(f"  {fname} 생성 (AI 에이전트용 위키 안내)")
+        elif "codewiki" not in p.read_text(encoding="utf-8", errors="replace"):
+            print(f"  참고: {fname}가 이미 있음 — 위키 안내 단락을 직접 추가하면 "
+                  f"에이전트가 위키를 자동 활용함")
     print(f"초기화 완료: {root}")
     print(f"  wiki/ 에 템플릿 {len(copied)}개 설치 (Obsidian에서 wiki/를 vault로 여세요)")
     if show_next:
@@ -979,15 +1045,162 @@ def cmd_status(root: Path):
     ndocs = len(list(wiki_docs(root))) if (root / "wiki").exists() else 0
     print(f"위키 문서(스텁 제외): {ndocs}개")
 
+# ---------------------------------------------------------------- context
+
+def cmd_context(root: Path, query: str):
+    """심볼 이름(또는 파일 경로)에 대한 작업 컨텍스트를 조립해 출력.
+    출력을 그대로 AI에게 주면 해당 심볼 작업에 필요한 지도가 된다."""
+    con = open_db(root)
+    cur = con.cursor()
+    base = query.split("::")[-1]
+    print(f"# 작업 컨텍스트: {query}\n")
+
+    syms = cur.execute(
+        "SELECT f.path, s.name, s.kind, s.signature, s.line_start, s.line_end "
+        "FROM symbols s JOIN files f ON f.id=s.file_id "
+        "WHERE s.name=? OR s.name=? OR s.name LIKE ? OR f.path=? "
+        "ORDER BY f.path LIMIT 10",
+        (query, base, f"%::{base}", query)).fetchall()
+    def_files = sorted({r[0] for r in syms})
+    if syms:
+        print("## 정의 위치\n")
+        for path, name, kind, sig, ls, le in syms:
+            print(f"- `{name}` ({kind}) {path}:{ls}-{le}  `{sig}`")
+    else:
+        print(f"## 정의 위치\n\n- facts.db에서 찾지 못함 "
+              f"(존재하지 않는다는 뜻은 아님 — 매크로/템플릿 가능성)")
+
+    callers = cur.execute(
+        "SELECT DISTINCT src_file, src_symbol FROM edges "
+        "WHERE kind='calls' AND dst_name=? LIMIT 15", (base,)).fetchall()
+    print("\n## 호출자 (이름 기반 추정 — 동명 함수 가능성 있음)\n")
+    if callers:
+        for src_file, src_sym in callers:
+            print(f"- {src_file} 의 `{src_sym}()`")
+    else:
+        print("- 색인에서 찾지 못함 (동적 호출/매크로는 안 잡힘)")
+
+    callees = cur.execute(
+        "SELECT DISTINCT dst_name FROM edges WHERE kind='calls' "
+        "AND (src_symbol=? OR src_symbol=?) LIMIT 20",
+        (query, base)).fetchall()
+    if callees:
+        print("\n## 호출 대상 (본문에서 발견된 이름들)\n")
+        resolved = []
+        for (dn,) in callees:
+            hits = cur.execute(
+                "SELECT DISTINCT f.path FROM symbols s "
+                "JOIN files f ON f.id=s.file_id WHERE s.name=? OR s.name "
+                "LIKE ? LIMIT 2", (dn, f"%::{dn}")).fetchall()
+            loc = hits[0][0] if len(hits) == 1 else \
+                ("여러 곳" if len(hits) > 1 else "외부/미해석")
+            resolved.append(f"- `{dn}()` → {loc}")
+        print("\n".join(sorted(resolved)))
+
+    print("\n## 관련 위키 문서\n")
+    found_doc = False
+    if (root / "wiki").exists():
+        for doc in wiki_docs(root):
+            text = doc.read_text(encoding="utf-8", errors="replace")
+            fm, body = parse_frontmatter(text)
+            deps = fm.get("depends", [])
+            if isinstance(deps, str):
+                deps = [deps]
+            dep_hit = any(fnmatch.fnmatch(f, dep) for f in def_files
+                          for dep in deps)
+            mention = base in body
+            if dep_hit or mention:
+                why = "의존 범위" if dep_hit else "본문 언급"
+                print(f"- {doc.relative_to(root)} ({why})")
+                found_doc = True
+    if not found_doc:
+        print("- 없음 — 이 심볼을 다루는 위키 문서가 아직 없음")
+    for f in def_files:
+        print(f"\n파일 stub: wiki/{stub_rel(f)}")
+
+
+# ---------------------------------------------------------------- doctor
+
+SELFTEST_CASES = [
+    ("C++ 같은 줄 중괄호", "cpp",
+     "void Server::start(int port) {\n}\n", ["Server::start"]),
+    ("C 다음 줄 중괄호(Allman)", "c",
+     "int foo(int x)\n{\n  return x;\n}\n", ["foo"]),
+    ("C++ 여러 줄 시그니처", "cpp",
+     "static int helper(int a,\n    int b)\n{\n  return a;\n}\n", ["helper"]),
+    ("C++ 생성자 초기화 리스트", "cpp",
+     "class W {\npublic:\n  W(int i) : id_(i) {}\n};\n", ["W"]),
+    ("C++ 주석 속 가짜 함수 무시", "cpp",
+     "// void fake() {\nint real() {\n}\n", ["real"]),
+    ("Python 함수/클래스", "python",
+     "class H:\n    def run(self):\n        pass\n\ndef util(x):\n    return x\n",
+     ["run", "util"]),
+    ("IDL interface/메서드", "idl",
+     "module M {\n  interface Svc {\n    void ping();\n  };\n};\n", ["ping"]),
+]
+
+
+def cmd_doctor(root: Path):
+    import platform
+    print(f"## 환경\n- Python {sys.version.split()[0]} / {platform.system()} "
+          f"{platform.release()}")
+    print(f"- universal-ctags: {'있음 (C/C++ 정밀 모드)' if has_universal_ctags() else '없음 → 내장 스캐너 사용 (정상)'}")
+    head = run_git(root, "rev-parse", "--short", "HEAD")
+    print(f"- git: {'커밋 ' + head if head else '저장소 아님 → update/최신성 검사 사용 불가'}")
+
+    print("\n## 파서 자가 테스트")
+    fails = 0
+    for desc, lang, code, want in SELFTEST_CASES:
+        syms, _ = parse_file(Path("selftest"), lang, code)
+        got = sorted(s[0] for s in syms
+                     if s[1] in ("function", "idl_method"))
+        ok = got == sorted(want)
+        if not ok:
+            fails += 1
+        print(f"- {'O' if ok else 'X'} {desc}"
+              + ("" if ok else f"  (기대 {want}, 실측 {got})"))
+
+    cfg = load_config(root)
+    files = list(iter_source_files(root, cfg))
+    print(f"\n## 색인 대상 훑기\n- 대상 파일: {len(files)}개")
+    from collections import Counter
+    langs = Counter(LANG_BY_EXT[p.suffix.lower()] for p in files)
+    print(f"- 언어별: {dict(langs)}")
+    dirs = Counter("/".join(p.relative_to(root).parts[:2][:-1]) or
+                   p.relative_to(root).parts[0] for p in files)
+    print("- 파일 많은 폴더 상위 8 (서드파티/생성 코드면 exclude_dirs에 추가 권장):")
+    for d, c in dirs.most_common(8):
+        print(f"    {d}/ : {c}개")
+    non_utf8 = 0
+    for p in files[:300]:
+        try:
+            _, _, enc = read_source(p)
+            if enc != "utf-8":
+                non_utf8 += 1
+        except Exception:
+            pass
+    if non_utf8:
+        print(f"- 인코딩: 표본 300개 중 {non_utf8}개가 UTF-8 아님 "
+              f"→ CP949 폴백으로 자동 처리됨 (한글 주석 보존)")
+    else:
+        print("- 인코딩: 표본에서 문제 없음 (UTF-8)")
+
+    print(f"\n{'문제 없음 — index를 진행하세요.' if fails == 0 else '파서 테스트 실패 — 이 출력과 함께 문의하세요.'}")
+    sys.exit(1 if fails else 0)
+
+
 # ---------------------------------------------------------------- main
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["setup", "init", "index", "stubs",
-                                        "map", "lint", "update", "status"])
+                                        "map", "lint", "update", "status",
+                                        "doctor", "context"])
     ap.add_argument("path", nargs="?", default=".",
                     help="대상 프로젝트 루트 (기본: 현재 디렉터리)")
+    ap.add_argument("query", nargs="?",
+                    help="(context 전용) 심볼 이름 또는 파일 경로")
     ap.add_argument("--mark-done", action="store_true",
                     help="(update 전용) 위키 갱신 완료를 현재 커밋으로 기록")
     args = ap.parse_intermixed_args()
@@ -1017,6 +1230,17 @@ def main():
         cmd_update(root, mark_done=args.mark_done)
     elif args.command == "status":
         cmd_status(root)
+    elif args.command == "doctor":
+        cmd_doctor(root)
+    elif args.command == "context":
+        if args.query is None:
+            # `cw.py context 심볼` 형태: path 자리에 온 것이 질의어
+            if args.path != "." and not Path(args.path).is_dir():
+                cmd_context(Path(".").resolve(), args.path)
+            else:
+                die("사용법: cw.py context [프로젝트경로] <심볼이름|파일경로>")
+        else:
+            cmd_context(root, args.query)
 
 
 if __name__ == "__main__":

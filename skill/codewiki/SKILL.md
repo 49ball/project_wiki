@@ -19,6 +19,7 @@ Obsidian 호환 위키를 만들고 증분 갱신하는 로컬 CLI다.
 
 | 명령 | 하는 일 |
 |---|---|
+| `$CW doctor <proj>` | 환경 점검 + 파서 자가 테스트 (새 환경 첫 실행 시) |
 | `$CW setup <proj>` | init+index+stubs+map 한 번에 (초기 준비는 이것 하나) |
 | `$CW init <proj>` | wiki/ 템플릿 + .codewiki/ 설치 (기존 문서 보존) |
 | `$CW index <proj>` | 심볼·관계 추출 → facts.db |
@@ -27,6 +28,7 @@ Obsidian 호환 위키를 만들고 증분 갱신하는 로컬 CLI다.
 | `$CW lint <proj>` | anchor 실존·confirmed 근거·최신성 검사 (에러 시 exit 1) |
 | `$CW update <proj>` | git diff로 stale 문서 탐지 + 부분 재색인 |
 | `$CW update <proj> --mark-done` | 위키 동기화 완료를 현재 커밋으로 기록 |
+| `$CW context <proj> <심볼>` | 심볼의 정의·호출자·호출 대상·관련 문서 조립 — 코드 수정 작업 전에 실행하면 좋음 |
 
 ## 워크플로우 (요청별)
 
