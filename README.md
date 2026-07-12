@@ -64,7 +64,7 @@ cw update --mark-done
 | `init` | wiki/ 템플릿 + .codewiki/ 설치 (기존 문서는 덮어쓰지 않음) | 0 |
 | `index` | 심볼·include·import 추출 → facts.db | 0 |
 | `stubs` | wiki/files/ 자동 문서 + INDEX.md 재생성 | 0 |
-| `map` | 모듈 후보·fan-in·엔트리포인트 요약 (AI에게 줄 지도) | 0 |
+| `map` | 모듈 후보·fan-in·엔트리포인트 요약 — `.codewiki/map.md`로도 저장 | 0 |
 | `lint` | anchor 실존, confirmed 근거, 문서 최신성 검사 | 0 |
 | `update` | git diff → 낡은 문서 탐지 + 부분 재색인 | 0 |
 | `status` | 색인/동기화 상태 | 0 |

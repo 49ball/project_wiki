@@ -23,7 +23,7 @@ Obsidian 호환 위키를 만들고 증분 갱신하는 로컬 CLI다.
 | `$CW init <proj>` | wiki/ 템플릿 + .codewiki/ 설치 (기존 문서 보존) |
 | `$CW index <proj>` | 심볼·관계 추출 → facts.db |
 | `$CW stubs <proj>` | wiki/files/ 자동 stub 재생성 |
-| `$CW map <proj>` | 모듈 후보·fan-in·엔트리포인트 지도 출력 |
+| `$CW map <proj>` | 모듈 후보·fan-in·엔트리포인트 지도 (`.codewiki/map.md`에도 저장) |
 | `$CW lint <proj>` | anchor 실존·confirmed 근거·최신성 검사 (에러 시 exit 1) |
 | `$CW update <proj>` | git diff로 stale 문서 탐지 + 부분 재색인 |
 | `$CW update <proj> --mark-done` | 위키 동기화 완료를 현재 커밋으로 기록 |

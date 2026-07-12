@@ -509,40 +509,62 @@ def _write_index(root: Path, cur):
 
 # ---------------------------------------------------------------- map
 
+MAP_ENTRY_LIMIT = 40
+
+
 def cmd_map(root: Path):
     con = open_db(root)
     cur = con.cursor()
-    print("# 프로젝트 지도 (AI에게 그대로 붙여넣어도 됨)\n")
-    print("## 디렉터리 = 모듈 후보\n")
+    out = ["# 프로젝트 지도 (AI에게 이 파일 또는 .codewiki/map.md를 주면 됨)\n",
+           "\n## 디렉터리 = 모듈 후보\n\n"]
+    all_files = cur.execute("SELECT path, lang, loc FROM files").fetchall()
+    # 최상위 폴더가 너무 적으면(src 하나에 다 몰린 구조) 한 단계 더 파고든다.
+    depth = 1
+    tops = {p.split("/")[0] for (p, _, _) in all_files if "/" in p}
+    if len(tops) <= 3:
+        depth = 2
     dirs = {}
-    for (path, lang, loc) in cur.execute("SELECT path, lang, loc FROM files"):
-        top = path.split("/")[0] if "/" in path else "(root)"
-        d = dirs.setdefault(top, {"files": 0, "loc": 0, "langs": set()})
+    for (path, lang, loc) in all_files:
+        parts = path.split("/")
+        key = "/".join(parts[:depth]) if len(parts) > depth else \
+            ("/".join(parts[:-1]) or "(root)")
+        d = dirs.setdefault(key, {"files": 0, "loc": 0, "langs": set()})
         d["files"] += 1
         d["loc"] += loc
         d["langs"].add(lang)
     for name in sorted(dirs, key=lambda k: -dirs[k]["loc"]):
         d = dirs[name]
-        print(f"- `{name}/` : {d['files']}개 파일, {d['loc']}줄, "
-              f"언어={','.join(sorted(d['langs']))}")
-    print("\n## 변경 파급이 큰 파일 (fan-in 상위)\n")
+        out.append(f"- `{name}/` : {d['files']}개 파일, {d['loc']}줄, "
+                   f"언어={','.join(sorted(d['langs']))}\n")
+    out.append("\n## 변경 파급이 큰 파일 (fan-in 상위)\n\n")
     for path, c in _fan_in(cur):
-        print(f"- {path}  ← {c}개 파일이 참조")
-    print("\n## 엔트리포인트 후보\n")
+        out.append(f"- {path}  ← {c}개 파일이 참조\n")
+    out.append("\n## 엔트리포인트 후보\n\n")
+    entries = []
     rows = cur.execute(
         "SELECT f.path, s.name, s.line_start FROM symbols s "
         "JOIN files f ON f.id=s.file_id WHERE s.name='main' "
         "OR s.kind='idl_interface' ORDER BY f.path").fetchall()
     for path, name, ls in rows:
-        print(f"- {path}:{ls}  `{name}`")
+        entries.append(f"- {path}:{ls}  `{name}`\n")
     py_mains = cur.execute("SELECT path FROM files WHERE lang='python'").fetchall()
     for (path,) in py_mains:
         try:
             if "__main__" in (root / path).read_text(encoding="utf-8",
                                                      errors="replace"):
-                print(f"- {path}  `if __name__ == '__main__'`")
+                entries.append(f"- {path}  `if __name__ == '__main__'`\n")
         except Exception:
             pass
+    out.extend(entries[:MAP_ENTRY_LIMIT])
+    if len(entries) > MAP_ENTRY_LIMIT:
+        out.append(f"- ... 외 {len(entries) - MAP_ENTRY_LIMIT}개 "
+                   f"(전체는 facts.db에서 조회 가능)\n")
+    text = "".join(out)
+    map_p = root / ".codewiki" / "map.md"
+    map_p.write_text(text, encoding="utf-8")
+    print(text)
+    print(f"(같은 내용이 {map_p.relative_to(root)} 에 저장됨 — "
+          f"복사 대신 이 파일을 AI에게 줘도 됨)", file=sys.stderr)
 
 # ---------------------------------------------------------------- lint
 
@@ -830,7 +852,7 @@ def main():
         cmd_map(root)
         print("=" * 60)
         print("\n준비 끝. 다음 한 가지만 하면 됩니다:")
-        print("  위의 지도 출력 + prompts/1-generate.md 를 AI에게 주고")
+        print("  .codewiki/map.md 파일 + prompts/1-generate.md 를 AI에게 주고")
         print("  위키 생성을 시키세요. (Claude Code면 '위키 만들어줘' 한마디면 됨)")
         print("  이후 코드가 바뀌면: cw.py update")
     elif args.command == "init":
