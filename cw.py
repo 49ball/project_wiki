@@ -32,6 +32,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 TOOLKIT_DIR = Path(__file__).resolve().parent
@@ -142,7 +143,11 @@ def parse_python(path: Path, text: str):
     """stdlib ast 사용 — python 심볼/임포트는 신뢰도 높음(confirmed)."""
     symbols, edges = [], []
     try:
-        tree = ast.parse(text)
+        # 색인 대상 파일의 문법 경고(invalid escape sequence 등)는
+        # 그 프로젝트의 문제이지 색인 오류가 아니므로 출력하지 않는다.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tree = ast.parse(text)
     except SyntaxError:
         return symbols, edges
     for node in ast.walk(tree):
@@ -349,8 +354,12 @@ def cmd_index(root: Path, only_files=None):
         cur.execute("DELETE FROM edges")
 
     n_sym = n_edge = 0
-    for p in targets:
+    show_progress = sys.stderr.isatty() and len(targets) > 10
+    for i, p in enumerate(targets, 1):
         rel = str(p.relative_to(root))
+        if show_progress and (i % 10 == 0 or i == len(targets)):
+            print(f"\r색인 중... {i}/{len(targets)}  {rel[:60]:<60}",
+                  end="", file=sys.stderr, flush=True)
         try:
             raw = p.read_bytes()
             text = raw.decode("utf-8", errors="replace")
@@ -383,6 +392,8 @@ def cmd_index(root: Path, only_files=None):
                         "VALUES(?,?,?,?,?,?,?)",
                         (rel, src_sym, dst_name, dst_file, kind, prov, conf))
             n_edge += 1
+    if show_progress:
+        print(file=sys.stderr)
     con.commit()
 
     head = run_git(root, "rev-parse", "--short", "HEAD")
@@ -428,7 +439,11 @@ def cmd_stubs(root: Path):
     files = cur.execute("SELECT id, path, sha, lang, loc FROM files "
                         "ORDER BY path").fetchall()
     known = {f[1] for f in files}
-    for fid, path, sha, lang, loc in files:
+    show_progress = sys.stderr.isatty() and len(files) > 10
+    for i, (fid, path, sha, lang, loc) in enumerate(files, 1):
+        if show_progress and (i % 20 == 0 or i == len(files)):
+            print(f"\rstub 생성 중... {i}/{len(files)}",
+                  end="", file=sys.stderr, flush=True)
         out = wiki / stub_rel(path)
         out.parent.mkdir(parents=True, exist_ok=True)
         body = [STUB_HEADER.format(src=path, sha=sha, lang=lang, loc=loc)]
@@ -456,6 +471,8 @@ def cmd_stubs(root: Path):
         body.append("## 참고\n\n- 이 목록에 없는 관계(동적 호출, 함수 포인터, "
                     "DI 등)는 '없는 것'이 아니라 '기계가 확인 못 한 것'입니다.\n")
         out.write_text("".join(body), encoding="utf-8")
+    if show_progress:
+        print(file=sys.stderr)
     _write_index(root, cur)
     print(f"stub 생성 완료: wiki/files/ 아래 {len(files)}개 + INDEX.md")
 
@@ -737,7 +754,7 @@ def cmd_update(root: Path, mark_done=False):
 
 # ---------------------------------------------------------------- init/status
 
-def cmd_init(root: Path):
+def cmd_init(root: Path, show_next=True):
     root = root.resolve()
     if not root.exists():
         die(f"경로가 없습니다: {root}")
@@ -766,7 +783,8 @@ def cmd_init(root: Path):
             indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"초기화 완료: {root}")
     print(f"  wiki/ 에 템플릿 {len(copied)}개 설치 (Obsidian에서 wiki/를 vault로 여세요)")
-    print(f"  다음: cw.py index {root} && cw.py stubs {root}")
+    if show_next:
+        print(f"  다음: cw.py index {root} && cw.py stubs {root}")
 
 
 def cmd_status(root: Path):
@@ -793,15 +811,26 @@ def cmd_status(root: Path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["init", "index", "stubs", "map",
-                                        "lint", "update", "status"])
+    ap.add_argument("command", choices=["setup", "init", "index", "stubs",
+                                        "map", "lint", "update", "status"])
     ap.add_argument("path", nargs="?", default=".",
                     help="대상 프로젝트 루트 (기본: 현재 디렉터리)")
     ap.add_argument("--mark-done", action="store_true",
                     help="(update 전용) 위키 갱신 완료를 현재 커밋으로 기록")
     args = ap.parse_intermixed_args()
     root = Path(args.path).resolve()
-    if args.command == "init":
+    if args.command == "setup":
+        cmd_init(root, show_next=False)
+        cmd_index(root)
+        cmd_stubs(root)
+        print("\n" + "=" * 60)
+        cmd_map(root)
+        print("=" * 60)
+        print("\n준비 끝. 다음 한 가지만 하면 됩니다:")
+        print("  위의 지도 출력 + prompts/1-generate.md 를 AI에게 주고")
+        print("  위키 생성을 시키세요. (Claude Code면 '위키 만들어줘' 한마디면 됨)")
+        print("  이후 코드가 바뀌면: cw.py update")
+    elif args.command == "init":
         cmd_init(root)
     elif args.command == "index":
         cmd_index(root)

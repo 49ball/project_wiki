@@ -19,6 +19,7 @@ Obsidian 호환 위키를 만들고 증분 갱신하는 로컬 CLI다.
 
 | 명령 | 하는 일 |
 |---|---|
+| `$CW setup <proj>` | init+index+stubs+map 한 번에 (초기 준비는 이것 하나) |
 | `$CW init <proj>` | wiki/ 템플릿 + .codewiki/ 설치 (기존 문서 보존) |
 | `$CW index <proj>` | 심볼·관계 추출 → facts.db |
 | `$CW stubs <proj>` | wiki/files/ 자동 stub 재생성 |
@@ -32,7 +33,7 @@ Obsidian 호환 위키를 만들고 증분 갱신하는 로컬 CLI다.
 작업 전에 반드시 `<proj>/wiki/conventions.md`를 읽고 그 규칙을 따르라.
 
 - **처음 위키 생성** ("위키 만들어줘", 온보딩 문서 요청):
-  `init → index → stubs → map` 실행 후, `~/codewiki/prompts/1-generate.md`를
+  `$CW setup <proj>` 실행 후, `~/codewiki/prompts/1-generate.md`를
   읽고 그 절차대로 모듈/흐름/개요 문서를 작성하라.
 - **코드 변경 후 갱신** ("위키 갱신", "코드 바꿨어"):
   `$CW update <proj>` 실행 → 출력된 stale 문서 목록에 대해

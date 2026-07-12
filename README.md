@@ -23,35 +23,34 @@
    코드를 놓친다. 그래서 "DB에 있으면 사실, DB에 없으면 모름"이지
    "없으면 거짓"이 아니다. 이 규칙이 도구/AI 전체에 강제되어 있다.
 
-## 빠른 시작
+## 빠른 시작 (외울 것은 setup과 update 두 개뿐)
 
 ```bash
-# 1. 프로젝트에 위키 골격 설치 (프로젝트마다 1회)
-python3 ~/codewiki/cw.py init /path/to/project
+# 편하게 쓰려면 alias 등록 (~/.zshrc 또는 ~/.bashrc에 추가)
+alias cw='python3 ~/codewiki/cw.py'
 
-# 2. 사실 추출 + 파일 stub 생성
-python3 ~/codewiki/cw.py index /path/to/project
-python3 ~/codewiki/cw.py stubs /path/to/project
+# 1. 프로젝트 루트(.git 있는 곳)에서 — 프로젝트마다 1회
+cd /path/to/project
+cw setup          # init+index+stubs+map을 한 번에 실행
 
-# 3. AI에게 지도를 주고 위키 생성 시키기
-python3 ~/codewiki/cw.py map /path/to/project     # 이 출력과
-cat ~/codewiki/prompts/1-generate.md              # 이 지시문을 AI 에이전트에게
+# 2. setup이 출력한 지도 + prompts/1-generate.md 를 AI에게 주고 위키 생성 시키기
+#    (Claude Code + codewiki 스킬이 있으면 "위키 만들어줘" 한마디면 됨)
 
-# 4. 검증
-python3 ~/codewiki/cw.py lint /path/to/project
-
-# 5. Obsidian에서 /path/to/project/wiki 를 vault로 열기
+# 3. Obsidian에서 /path/to/project/wiki 를 vault로 열기
 ```
+
+경로를 생략하면 현재 디렉터리가 대상. `cw setup /path/to/project`처럼
+경로를 줘도 된다. 개별 단계(init/index/stubs/map)는 필요할 때만 따로 실행.
 
 ## 코드가 바뀐 뒤 (증분 갱신)
 
 ```bash
-python3 ~/codewiki/cw.py update /path/to/project
-# → 변경 파일 재색인 + stub 재생성 + "낡은 문서 목록" 출력
+cw update         # 프로젝트 루트에서 — 변경 재색인 + 낡은 문서 목록 출력
 # → 그 목록과 prompts/2-update.md 를 AI에게 준다
-# → AI가 고치면:
-python3 ~/codewiki/cw.py lint /path/to/project
-python3 ~/codewiki/cw.py update --mark-done /path/to/project
+#   (Claude Code면 "위키 갱신해줘" 한마디 — lint와 mark-done까지 알아서 함)
+# → 수동으로 할 경우 AI가 고친 뒤:
+cw lint
+cw update --mark-done
 ```
 
 주기적으로(예: 분기마다) `prompts/3-verify.md`로 위키를 작성하지 않은
@@ -61,6 +60,7 @@ python3 ~/codewiki/cw.py update --mark-done /path/to/project
 
 | 명령 | 하는 일 | LLM 비용 |
 |---|---|---|
+| `setup` | **init+index+stubs+map 한 번에** (처음에 이것만 쓰면 됨) | 0 |
 | `init` | wiki/ 템플릿 + .codewiki/ 설치 (기존 문서는 덮어쓰지 않음) | 0 |
 | `index` | 심볼·include·import 추출 → facts.db | 0 |
 | `stubs` | wiki/files/ 자동 문서 + INDEX.md 재생성 | 0 |
