@@ -14,6 +14,7 @@ codewiki (cw.py) — 코드 프로젝트용 AI Wiki 툴킷의 결정론적 부�
   cw.py update [경로]           git diff 기반으로 낡은(stale) 문서 찾기 + 재색인
   cw.py update --mark-done      AI 갱신 완료 후 현재 커밋을 기준점으로 기록
   cw.py status [경로]           색인 상태 요약
+  cw.py parse-report [경로]     파서가 코드를 얼마나 읽어냈는지 진단 + 권고
 
 설계 원칙:
   - 코드는 절대 위키로 복사하지 않는다. anchor(경로:라인, sym:경로#이름)로 참조만 한다.
@@ -1564,14 +1565,129 @@ SELFTEST_CASES = [
      ["run", "util"]),
     ("IDL interface/메서드", "idl",
      "module M {\n  interface Svc {\n    void ping();\n  };\n};\n", ["ping"]),
+    ("C++ operator()", "cpp",
+     "struct S { int operator()(int a) const { return a; } };\n",
+     ["operator()"]),
+    ("AUTOSAR 스타일 시그니처", "c",
+     "FUNC(void, RTE_CODE) Rte_Write_Sig(VAR(uint8, AUTOMATIC) v)\n"
+     "{\n  send(v);\n}\n", ["Rte_Write_Sig"]),
 ]
+
+
+GAP_LABEL = {
+    "parse_error": "문법 해석 실패",
+    "parse_missing": "빠진 토큰(매크로 의심)",
+    "macro_mangled_decl": "매크로가 시그니처를 가림",
+    "token_paste": "## 토큰 붙이기(이름이 소스에 없음)",
+    "fnptr_table": "함수 포인터 테이블 등록",
+    "ifdef_branch": "조건부 컴파일 분기",
+    "inline_asm": "인라인 asm",
+}
+
+GAP_ADVICE = {
+    "parse_error": "매크로 전개기가 필요합니다. 아래 파일의 매크로부터 처리하면 크게 줄어듭니다.",
+    "parse_missing": "매크로 전개기가 필요합니다.",
+    "macro_mangled_decl": "이 심볼들의 이름은 실제와 다를 수 있습니다. 위키에서 사실로 단정하면 안 됩니다.",
+    "token_paste": "생성되는 함수 이름이 소스에 없습니다. 매크로 전개기 없이는 찾을 수 없습니다.",
+    "fnptr_table": "여기 등록된 함수들은 '호출자 없음'으로 보일 수 있습니다. 데드코드 판정 시 주의하세요.",
+    "ifdef_branch": "빌드 변형별로 다른 코드가 살아납니다. 어느 변형이 출하되는지는 코드에 없습니다.",
+    "inline_asm": "해석 불가 구간입니다. 수동 확인이 필요합니다.",
+}
+
+# 판정(좋음/보통/나쁨)에 반영되는 구멍 — "파서가 읽어내지 못했다"에 해당하는 것들.
+# fnptr_table / ifdef_branch / inline_asm 은 파싱 실패가 아니라 코드의 성질이다.
+# 이들은 따로 보고하되 판정 비율에는 넣지 않는다. 안 그러면 매크로가 멀쩡한
+# 코드도 #ifdef 가 많다는 이유로 '나쁨'이 되어 판정이 쓸모없어진다.
+PARSE_QUALITY_GAPS = ("parse_error", "parse_missing",
+                      "macro_mangled_decl", "token_paste")
+
+
+def cmd_parse_report(root: Path):
+    """파서가 이 코드베이스를 얼마나 읽어냈는지 '결론'을 낸다.
+
+    설계 §2.2-①: 사용자가 사내 출력을 반출할 수 없으므로 판단을 도구에 내장한다.
+    데이터가 아니라 판정·원인·권고를 낸다.
+    """
+    from collections import Counter
+    con = open_db(root)
+    cur = con.cursor()
+
+    n_files = cur.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    n_sym = cur.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+    n_gap = cur.execute("SELECT COUNT(*) FROM gaps").fetchone()[0]
+
+    ok, reason = ts_status()
+    print("## 파서")
+    print(f"- {reason}")
+    if not ok:
+        print("  → 정밀 모드가 아닙니다. 내장 스캐너는 자기가 못 읽은 곳을 "
+              "알지 못하므로,\n    아래 '구멍' 수치는 실제보다 훨씬 적게 나옵니다.")
+
+    print(f"\n## 규모\n- 파일 {n_files}개, 심볼 {n_sym}개, 구멍 {n_gap}곳")
+    if n_files == 0:
+        print("\n색인된 파일이 없습니다. 먼저 `cw index`를 실행하세요.")
+        return 1
+
+    # 판정은 '파서가 못 읽은 것'만으로 낸다. 조건부 컴파일이나 함수 포인터
+    # 테이블은 코드의 성질이지 파싱 실패가 아니다.
+    ph = ",".join("?" * len(PARSE_QUALITY_GAPS))
+    bad_files = cur.execute(
+        f"SELECT COUNT(DISTINCT file) FROM gaps WHERE kind IN ({ph})",
+        PARSE_QUALITY_GAPS).fetchone()[0]
+
+    ratio = bad_files / n_files
+    if ratio < 0.10:
+        verdict, code = "좋음", 0
+    elif ratio < 0.30:
+        verdict, code = "보통", 1
+    else:
+        verdict, code = "나쁨", 1
+    print(f"\n## 판정: {verdict} "
+          f"(파서가 못 읽은 파일 {bad_files}/{n_files} = {ratio*100:.0f}%)")
+
+    kinds = Counter(r[0] for r in cur.execute("SELECT kind FROM gaps"))
+    if not kinds:
+        print("\n해석하지 못한 지점이 없습니다. 파서가 이 코드를 잘 읽고 있습니다.")
+        return code
+
+    quality = [(k, c) for k, c in kinds.most_common() if k in PARSE_QUALITY_GAPS]
+    info = [(k, c) for k, c in kinds.most_common() if k not in PARSE_QUALITY_GAPS]
+
+    if quality:
+        print("\n## 파서가 못 읽은 것 (판정에 반영됨)")
+        for kind, cnt in quality:
+            print(f"- {GAP_LABEL.get(kind, kind)} ({kind}): {cnt}곳")
+    if info:
+        print("\n## 코드의 성질 (판정에 반영 안 됨, 그러나 알아야 함)")
+        for kind, cnt in info:
+            print(f"- {GAP_LABEL.get(kind, kind)} ({kind}): {cnt}곳")
+
+    print("\n## 다음에 할 일")
+    for kind, _cnt in (quality + info)[:3]:
+        print(f"→ {GAP_ADVICE.get(kind, '확인이 필요합니다.')}")
+
+    rows = cur.execute(
+        f"SELECT file, COUNT(*) c FROM gaps WHERE kind IN ({ph}) "
+        "GROUP BY file ORDER BY c DESC LIMIT 5", PARSE_QUALITY_GAPS).fetchall()
+    if rows:
+        print("\n## 못 읽은 곳이 몰린 파일 상위 5")
+        for f, c in rows:
+            print(f"- {f}: {c}곳")
+        print("  → 이 파일들의 매크로를 먼저 처리하면 가장 크게 개선됩니다.")
+
+    print(f"\n{'조치가 필요합니다.' if code else '진행해도 좋습니다.'}")
+    return code
 
 
 def cmd_doctor(root: Path):
     import platform
     print(f"## 환경\n- Python {sys.version.split()[0]} / {platform.system()} "
           f"{platform.release()}")
-    print(f"- universal-ctags: {'있음 (C/C++ 정밀 모드)' if has_universal_ctags() else '없음 → 내장 스캐너 사용 (정상)'}")
+    _ts_ok, _ts_reason = ts_status()
+    print(f"- C/C++ 파서: {_ts_reason}")
+    if not _ts_ok:
+        print(f"- universal-ctags: {'있음' if has_universal_ctags() else '없음'} "
+              "(tree-sitter 없을 때만 쓰임)")
     head = run_git(root, "rev-parse", "--short", "HEAD")
     print(f"- git: {'커밋 ' + head if head else '저장소 아님 → update/최신성 검사 사용 불가'}")
 
@@ -1612,6 +1728,8 @@ def cmd_doctor(root: Path):
     else:
         print("- 인코딩: 표본에서 문제 없음 (UTF-8)")
 
+    print("\n다음: `cw index` 후 `cw parse-report` 로 파서가 이 코드를 "
+          "얼마나 읽어냈는지 확인하세요.")
     print(f"\n{'문제 없음 — index를 진행하세요.' if fails == 0 else '파서 테스트 실패 — 이 출력과 함께 문의하세요.'}")
     sys.exit(1 if fails else 0)
 
@@ -1623,7 +1741,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["setup", "init", "index", "stubs",
                                         "map", "lint", "update", "status",
-                                        "doctor", "context", "coverage"])
+                                        "doctor", "context", "coverage",
+                                        "parse-report"])
     ap.add_argument("path", nargs="?", default=".",
                     help="대상 프로젝트 루트 (기본: 현재 디렉터리)")
     ap.add_argument("query", nargs="?",
@@ -1659,6 +1778,8 @@ def main():
         cmd_status(root)
     elif args.command == "doctor":
         cmd_doctor(root)
+    elif args.command == "parse-report":
+        sys.exit(cmd_parse_report(root))
     elif args.command == "coverage":
         cmd_coverage(root)
     elif args.command == "context":
