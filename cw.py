@@ -145,6 +145,13 @@ CREATE TABLE IF NOT EXISTS symbols(
 CREATE TABLE IF NOT EXISTS edges(
   id INTEGER PRIMARY KEY, src_file TEXT, src_symbol TEXT,
   dst_name TEXT, dst_file TEXT, kind TEXT, provenance TEXT, confidence TEXT);
+CREATE TABLE IF NOT EXISTS gaps(
+  id INTEGER PRIMARY KEY, file TEXT, line INTEGER, kind TEXT,
+  detail TEXT, affects_symbol TEXT,
+  status TEXT NOT NULL DEFAULT 'open', resolution TEXT, evidence TEXT);
+CREATE INDEX IF NOT EXISTS idx_gap_file ON gaps(file);
+CREATE INDEX IF NOT EXISTS idx_gap_sym ON gaps(affects_symbol);
+CREATE INDEX IF NOT EXISTS idx_gap_kind ON gaps(kind);
 CREATE INDEX IF NOT EXISTS idx_sym_file ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_edge_src ON edges(src_file);
 CREATE INDEX IF NOT EXISTS idx_edge_dst ON edges(dst_file);
