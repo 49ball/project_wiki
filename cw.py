@@ -1675,7 +1675,14 @@ def cmd_parse_report(root: Path):
             print(f"- {f}: {c}곳")
         print("  → 이 파일들의 매크로를 먼저 처리하면 가장 크게 개선됩니다.")
 
-    print(f"\n{'조치가 필요합니다.' if code else '진행해도 좋습니다.'}")
+    print("\n" + "-" * 60)
+    if code:
+        print("구멍이 있는 것은 고장이 아닙니다. 빌드를 돌리지 않고 소스만 읽는 이상\n"
+              "매크로·조건부 컴파일은 원래 완전히 해석할 수 없습니다.\n"
+              "중요한 건 '못 읽은 곳을 알고 있다'는 것이고, 위 목록이 바로 그것입니다.\n"
+              "위키를 만들 때 AI가 이 지점들을 사실로 단정하지 않게 됩니다.")
+    else:
+        print("파서가 이 코드를 잘 읽고 있습니다. 위키를 만들어도 좋습니다.")
     return code
 
 
@@ -1758,9 +1765,12 @@ def main():
         print("\n" + "=" * 60)
         cmd_map(root)
         print("=" * 60)
-        print("\n준비 끝. 다음 한 가지만 하면 됩니다:")
-        print("  .codewiki/map.md 파일 + prompts/1-generate.md 를 AI에게 주고")
-        print("  위키 생성을 시키세요. (Claude Code면 '위키 만들어줘' 한마디면 됨)")
+        print("\n준비 끝. 다음 두 가지를 하세요:")
+        print("  1) cw parse-report")
+        print("     ← 파서가 이 코드를 얼마나 읽어냈는지 먼저 확인하세요.")
+        print("       못 읽은 곳이 어디인지 알아야 위키를 믿을 수 있습니다.")
+        print("  2) .codewiki/map.md 파일 + prompts/1-generate.md 를 AI에게 주고")
+        print("     위키 생성을 시키세요. (Claude Code면 '위키 만들어줘' 한마디면 됨)")
         print("  이후 코드가 바뀌면: cw.py update")
     elif args.command == "init":
         cmd_init(root)
