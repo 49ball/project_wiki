@@ -36,5 +36,45 @@ class TestLegacyParserBaseline(unittest.TestCase):
         self.assertGreater(len(passed), 0, "기준선 수집 자체가 실패했다면 하네스 버그")
 
 
+class TestTreeSitterParser(unittest.TestCase):
+
+    def setUp(self):
+        ok, reason = cw.ts_status()
+        if not ok:
+            self.skipTest(reason)
+
+    def test_symbols(self):
+        bad = []
+        for c in PARSER_CASES:
+            r = cw.parse_c_cpp_ts(Path("t"), c.src, c.lang)
+            self.assertIsNotNone(r, f"{c.name}: 파서가 None 반환")
+            got = symbols_of(r[0])
+            if got != sorted(c.symbols):
+                bad.append(f"{c.name}: 기대 {sorted(c.symbols)}, 실측 {got}")
+        self.assertEqual(bad, [], "\n".join(bad))
+
+    def test_returns_three_tuples(self):
+        r = cw.parse_c_cpp_ts(Path("t"), "int f(void){return 0;}\n", "c")
+        self.assertEqual(len(r), 3, "(symbols, edges, gaps) 3-튜플이어야 한다")
+
+    def test_clean_code_has_no_gaps(self):
+        """깨끗한 코드에서 구멍이 뜨면 커버리지 경고가 노이즈가 된다."""
+        for c in PARSER_CASES:
+            if c.gaps:
+                continue
+            _s, _e, gaps = cw.parse_c_cpp_ts(Path("t"), c.src, c.lang)
+            self.assertEqual(gaps, [], f"{c.name}: 깨끗한 코드에 구멍 {gaps}")
+
+    def test_extracts_includes_and_calls(self):
+        _s, edges, _g = cw.parse_c_cpp_ts(
+            Path("t"),
+            '#include "server.h"\nvoid run(void) { init(); step(); }\n', "c")
+        # 엣지 튜플: (src_sym, dst_name, dst_file, kind, provenance, confidence)
+        incs = [e[1] for e in edges if e[3] == "includes"]
+        calls = [(e[0], e[1]) for e in edges if e[3] == "calls"]
+        self.assertEqual(incs, ["server.h"])
+        self.assertEqual(sorted(calls), [("run", "init"), ("run", "step")])
+
+
 if __name__ == "__main__":
     unittest.main()

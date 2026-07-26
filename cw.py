@@ -540,6 +540,167 @@ def ts_status():
     return (langs is not None), reason
 
 
+_TS_NAME_NODES = ("identifier", "field_identifier", "qualified_identifier",
+                  "operator_name", "destructor_name", "type_identifier")
+
+
+def _ts_is_include_guard(node, src):
+    """인클루드 가드(#ifndef FOO_H / #define FOO_H)인가?
+
+    가드는 거의 모든 헤더에 있으므로 이걸 조건부 컴파일 구멍으로 세면
+    판정이 항상 '나쁨'이 되고 커버리지 경고가 노이즈가 되어 무시당한다.
+    가드는 빌드 변형이 아니라 관용구이므로 제외한다.
+
+    판별: 최상위 preproc_ifdef 이면서 #else 가 없고,
+          안쪽 첫 지시문이 같은 이름의 #define 인 것.
+    """
+    if node.type != "preproc_ifdef":
+        return False
+    if node.parent is None or node.parent.type != "translation_unit":
+        return False
+    if node.child_by_field_name("alternative") is not None:
+        return False
+    nm = node.child_by_field_name("name")
+    if nm is None:
+        return False
+    guard = src[nm.start_byte:nm.end_byte].decode("utf-8", "replace")
+    for ch in node.children:
+        if ch.type in ("preproc_def", "preproc_function_def"):
+            d = ch.child_by_field_name("name")
+            return (d is not None and
+                    src[d.start_byte:d.end_byte].decode(
+                        "utf-8", "replace") == guard)
+        if ch.type not in ("#ifndef", "#ifdef", "identifier", "comment"):
+            return False
+    return False
+
+
+def _ts_decl_name(node, src):
+    """function_definition 에서 (이름, 매크로로_뭉개짐) 추출.
+
+    매크로가 시그니처에 끼면 tree-sitter 는 declarator 를
+    parenthesized_declarator 로 파싱한다. 이때 진짜 이름은 그 앞의
+    type_identifier 에 들어간다. 예:
+        FUNC(void, RTE_CODE) Rte_Write_Sig(VAR(uint8, AUTOMATIC) v)
+        → type_identifier[Rte_Write_Sig] + parenthesized_declarator[(...)]
+    이 모양은 ERROR 노드 없이도 나타나므로 has_error 만으로는 못 잡는다.
+    """
+    d = node.child_by_field_name("declarator")
+    while d is not None:
+        if d.type == "parenthesized_declarator":
+            for ch in node.children:
+                if ch is d:
+                    break
+                if ch.type == "type_identifier":
+                    return src[ch.start_byte:ch.end_byte].decode(
+                        "utf-8", "replace"), True
+            return None, True
+        if d.type in _TS_NAME_NODES:
+            return src[d.start_byte:d.end_byte].decode("utf-8", "replace"), False
+        nxt = d.child_by_field_name("declarator")
+        if nxt is None:
+            for ch in d.children:
+                if ch.type in _TS_NAME_NODES:
+                    return src[ch.start_byte:ch.end_byte].decode(
+                        "utf-8", "replace"), False
+            return None, True
+        d = nxt
+    return None, True
+
+
+def parse_c_cpp_ts(path: Path, text: str, lang: str):
+    """tree-sitter 파서. (symbols, edges, gaps) 반환. 불가 시 None.
+
+    gaps 항목은 (kind, line, detail, affects_symbol) 4-튜플.
+    """
+    langs = ts_languages()
+    if langs is None:
+        return None
+    from tree_sitter import Parser
+    src = text.encode("utf-8", "replace")
+    try:
+        tree = Parser(langs["cpp" if lang == "cpp" else "c"]).parse(src)
+    except Exception:
+        return None
+
+    symbols, edges, gaps = [], [], []
+
+    def txt(n):
+        return src[n.start_byte:n.end_byte].decode("utf-8", "replace")
+
+    def walk(n, enclosing):
+        line = n.start_point[0] + 1
+        cur = enclosing
+
+        # ERROR/MISSING 은 별도 if 로 둔다. elif 로 묶으면 ERROR 노드 안의
+        # 함수 정의를 놓친다.
+        if n.is_missing:
+            gaps.append(("parse_missing", line,
+                         "문법상 빠진 토큰 '%s' — 매크로 때문일 수 있음" % n.type,
+                         None))
+        elif n.is_error:
+            gaps.append(("parse_error", line,
+                         "이 구간을 문법으로 해석하지 못함", None))
+
+        if n.type == "function_definition":
+            name, mangled = _ts_decl_name(n, src)
+            if name:
+                symbols.append((name, "function",
+                                txt(n).split("{")[0].strip()[:120],
+                                line, n.end_point[0] + 1, "tree-sitter"))
+                cur = name
+            if mangled:
+                gaps.append(("macro_mangled_decl", line,
+                             "매크로가 시그니처를 가림 — 실제 이름이 다를 수 있음",
+                             name))
+        elif n.type in ("class_specifier", "struct_specifier", "enum_specifier"):
+            nm = n.child_by_field_name("name")
+            if nm is not None:
+                kind = {"class_specifier": "class", "struct_specifier": "struct",
+                        "enum_specifier": "enum"}[n.type]
+                symbols.append((txt(nm), kind, txt(n).split("{")[0].strip()[:120],
+                                line, n.end_point[0] + 1, "tree-sitter"))
+        elif n.type == "preproc_include":
+            p = n.child_by_field_name("path")
+            if p is not None:
+                edges.append((None, txt(p).strip('"<>'), None, "includes",
+                              "tree-sitter", "confirmed"))
+        elif n.type == "call_expression":
+            fn = n.child_by_field_name("function")
+            if fn is not None and fn.type in _TS_NAME_NODES:
+                edges.append((enclosing, txt(fn), None, "calls",
+                              "tree-sitter", "inferred"))
+        elif n.type == "initializer_list":
+            # 함수 포인터 테이블 — 초기화 리스트 안의 맨 식별자는 함수를
+            # 가리킬 수 있다. 호출로 안 잡히므로 구멍으로 남긴다.
+            for ch in n.children:
+                if ch.type == "identifier":
+                    gaps.append(("fnptr_table", ch.start_point[0] + 1,
+                                 "%s — 테이블 등록. 호출로 잡히지 않음" % txt(ch),
+                                 None))
+        elif n.type == "preproc_arg":
+            if "##" in txt(n):
+                gaps.append(("token_paste", line,
+                             "## 토큰 붙이기 — 생성되는 이름이 소스에 없음", None))
+        elif n.type in ("preproc_ifdef", "preproc_if"):
+            # preproc_else/elif 는 기록하지 않는다 — 머리 노드 하나가
+            # 조건부 그룹 전체를 대표한다. 안 그러면 한 그룹이 2~3번 세어진다.
+            if not _ts_is_include_guard(n, src):
+                cond = n.child_by_field_name("name")
+                gaps.append(("ifdef_branch", line,
+                             "조건부 컴파일 %s — 어느 분기가 빌드되는지 알 수 없음"
+                             % (txt(cond) if cond is not None else n.type),
+                             None))
+        elif n.type in ("gnu_asm_expression", "asm_statement"):
+            gaps.append(("inline_asm", line, "인라인 asm — 해석 불가", None))
+
+        for ch in n.children:
+            walk(ch, cur)
+
+    walk(tree.root_node, None)
+    return symbols, edges, gaps
+
+
 def parse_file(path: Path, lang: str, text: str):
     if lang == "python":
         return parse_python(path, text)
