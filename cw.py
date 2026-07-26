@@ -708,14 +708,28 @@ def parse_c_cpp_ts(path: Path, text: str, lang: str):
     return symbols, edges, gaps
 
 
+_LAST_GAPS = []   # 직전 parse_file 호출이 발견한 구멍. cmd_index 가 회수한다.
+
+
 def parse_file(path: Path, lang: str, text: str):
+    """(symbols, edges) 반환. 구멍은 _LAST_GAPS 에 남긴다.
+
+    반환 시그니처를 바꾸지 않는 이유: cmd_doctor 등 기존 호출부를 깨지 않기 위함.
+    """
+    global _LAST_GAPS
+    _LAST_GAPS = []
     if lang == "python":
         return parse_python(path, text)
     if lang in ("c", "cpp"):
-        if has_universal_ctags():
-            r = parse_c_cpp_ctags(path, text)
-            if r is not None:
-                return r
+        r = parse_c_cpp_ts(path, text, lang)
+        if r is not None:
+            symbols, edges, gaps = r
+            _LAST_GAPS = gaps
+            return symbols, edges
+        if has_universal_ctags():          # tree-sitter 없을 때만 폴백
+            r2 = parse_c_cpp_ctags(path, text)
+            if r2 is not None:
+                return r2
         return parse_c_cpp(path, text)
     if lang == "idl":
         return parse_idl(path, text)
@@ -758,13 +772,15 @@ def cmd_index(root: Path, only_files=None):
                 cur.execute("DELETE FROM symbols WHERE file_id IN "
                             "(SELECT id FROM files WHERE path=?)", (f,))
                 cur.execute("DELETE FROM edges WHERE src_file=?", (f,))
+                cur.execute("DELETE FROM gaps WHERE file=?", (f,))
                 cur.execute("DELETE FROM files WHERE path=?", (f,))
     else:
         cur.execute("DELETE FROM files")
         cur.execute("DELETE FROM symbols")
         cur.execute("DELETE FROM edges")
+        cur.execute("DELETE FROM gaps")
 
-    n_sym = n_edge = 0
+    n_sym = n_edge = n_gap = 0
     show_progress = sys.stderr.isatty() and len(targets) > 10
     for i, p in enumerate(targets, 1):
         rel = p.relative_to(root).as_posix()
@@ -781,6 +797,7 @@ def cmd_index(root: Path, only_files=None):
         cur.execute("DELETE FROM symbols WHERE file_id IN "
                     "(SELECT id FROM files WHERE path=?)", (rel,))
         cur.execute("DELETE FROM edges WHERE src_file=?", (rel,))
+        cur.execute("DELETE FROM gaps WHERE file=?", (rel,))
         cur.execute("DELETE FROM files WHERE path=?", (rel,))
         cur.execute("INSERT INTO files(path, sha, lang, loc) VALUES(?,?,?,?)",
                     (rel, sha, lang, loc))
@@ -802,6 +819,12 @@ def cmd_index(root: Path, only_files=None):
                         "VALUES(?,?,?,?,?,?,?)",
                         (rel, src_sym, dst_name, dst_file, kind, prov, conf))
             n_edge += 1
+        # 미해석 대장 — 파서가 못 읽은 지점. 설계 §6.3
+        for (gkind, gline, gdetail, gaffects) in _LAST_GAPS:
+            cur.execute("INSERT INTO gaps(file,line,kind,detail,affects_symbol,"
+                        "status) VALUES(?,?,?,?,?,'open')",
+                        (rel, gline, gkind, gdetail, gaffects))
+            n_gap += 1
     if show_progress:
         print(file=sys.stderr)
     n_bind = _link_boundaries(root, cur)
@@ -818,8 +841,8 @@ def cmd_index(root: Path, only_files=None):
     scope = f"{len(targets)}개 파일(부분)" if only_files else f"{len(targets)}개 파일(전체)"
     if n_bind:
         scope += f", 경계 연결 {n_bind}개"
-    print(f"색인 완료: {scope}, 심볼 {n_sym}개, 관계 {n_edge}개"
-          f"{' [ctags]' if has_universal_ctags() else ' [내장 스캐너]'}")
+    print(f"색인 완료: {scope}, 심볼 {n_sym}개, 관계 {n_edge}개, 구멍 {n_gap}곳"
+          f"{' [tree-sitter]' if ts_status()[0] else (' [ctags]' if has_universal_ctags() else ' [내장 스캐너]')}")
     if head:
         print(f"기준 커밋: {head}")
 
