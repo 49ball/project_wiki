@@ -291,7 +291,7 @@ class TestCorpusRegression(unittest.TestCase):
         total_sym = 0
         crashed = []
         for p in files:
-            text, _, _ = cw.read_source(p)
+            _raw, text, _enc = cw.read_source(p)   # (raw, text, enc) 순서다
             lang = cw.LANG_BY_EXT.get(p.suffix.lower(), "c")
             try:
                 syms, _edges = cw.parse_file(p, lang, text)
