@@ -488,6 +488,58 @@ def has_universal_ctags():
     return _HAS_UCTAGS
 
 
+# ---------------------------------------------------------------- tree-sitter
+# 교체 이유는 정확도가 아니라 "못 읽은 것을 말해주는 능력"이다.
+# 정규식 스캐너는 못 읽으면 조용히 넘어가므로, 자기가 뭘 놓쳤는지 모른다.
+# tree-sitter는 해석 실패를 ERROR/MISSING 노드로 알려주고, 그것이
+# 미해석 대장(gaps)의 재료가 된다.
+
+_TS_CACHE = None   # (languages_or_None, reason)
+
+
+def _ts_load():
+    """tree-sitter 로드 시도. 실패해도 예외를 밖으로 내보내지 않는다."""
+    try:
+        from tree_sitter import Language, Parser  # noqa: F401
+    except ImportError:
+        return None, ("tree-sitter 미설치 → 내장 정규식 파서 사용. "
+                      "정밀 모드를 쓰려면: pip install -r requirements-parser.txt")
+    try:
+        import tree_sitter_c
+        import tree_sitter_cpp
+    except ImportError:
+        return None, ("tree-sitter 문법 패키지 미설치 → 내장 정규식 파서 사용. "
+                      "pip install -r requirements-parser.txt")
+    try:
+        from tree_sitter import Language, Parser
+        langs = {"c": Language(tree_sitter_c.language()),
+                 "cpp": Language(tree_sitter_cpp.language())}
+        Parser(langs["c"])          # ABI 호환성은 여기서 터진다
+        return langs, "tree-sitter 사용 가능 (정밀 모드)"
+    except Exception as e:
+        return None, (f"tree-sitter 버전 충돌 → 내장 정규식 파서 사용 ({e}). "
+                      "requirements-parser.txt 의 핀 버전으로 맞추세요: "
+                      "pip install -r requirements-parser.txt")
+
+
+def _ts_get():
+    global _TS_CACHE
+    if _TS_CACHE is None:
+        _TS_CACHE = _ts_load()
+    return _TS_CACHE
+
+
+def ts_languages():
+    """{'c': Language, 'cpp': Language} 또는 None."""
+    return _ts_get()[0]
+
+
+def ts_status():
+    """(사용가능여부, 사람이 읽는 사유)."""
+    langs, reason = _ts_get()
+    return (langs is not None), reason
+
+
 def parse_file(path: Path, lang: str, text: str):
     if lang == "python":
         return parse_python(path, text)

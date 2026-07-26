@@ -1,0 +1,13 @@
+# 선택적 의존 — 없으면 cw.py는 내장 정규식 파서로 폴백한다.
+#
+# 버전 조합 주의 (실측 확인):
+#   tree-sitter 0.23.2 는 문법 ABI 13~14 만 받는다.
+#   tree-sitter-c/cpp 0.23.5+ 는 ABI 15 라 위와 충돌한다.
+#   tree-sitter 0.24+ 는 Python 3.10+ 를 요구한다.
+# 아래 조합은 Python 3.9 에서 동작을 확인했다.
+#
+# 설치: pip install -r requirements-parser.txt
+# 확인: cw doctor
+tree-sitter==0.23.2
+tree-sitter-c==0.23.4
+tree-sitter-cpp==0.23.4
