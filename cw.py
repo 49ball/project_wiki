@@ -632,11 +632,29 @@ def parse_c_cpp_ts(path: Path, text: str, lang: str):
         return None
 
     symbols, edges, gaps = [], [], []
+    guard_names = set()   # 인클루드 가드의 #define 은 심볼이 아니다
 
     def txt(n):
         return src[n.start_byte:n.end_byte].decode("utf-8", "replace")
 
-    def walk(n, enclosing):
+    def _decl_ident(node):
+        """declaration/declarator 사슬을 타고 내려가 이름 노드를 찾는다."""
+        d = node
+        seen = 0
+        while d is not None and seen < 12:
+            seen += 1
+            if d.type in _TS_NAME_NODES:
+                return d
+            nxt = d.child_by_field_name("declarator")
+            if nxt is None:
+                for ch in d.children:
+                    if ch.type in _TS_NAME_NODES:
+                        return ch
+                return None
+            d = nxt
+        return None
+
+    def walk(n, enclosing, in_func=False):
         line = n.start_point[0] + 1
         cur = enclosing
 
@@ -661,12 +679,58 @@ def parse_c_cpp_ts(path: Path, text: str, lang: str):
                 gaps.append(("macro_mangled_decl", line,
                              "매크로가 시그니처를 가림 — 실제 이름이 다를 수 있음",
                              name))
-        elif n.type in ("class_specifier", "struct_specifier", "enum_specifier"):
+        elif n.type in ("class_specifier", "struct_specifier", "enum_specifier",
+                        "union_specifier"):
             nm = n.child_by_field_name("name")
             if nm is not None:
                 kind = {"class_specifier": "class", "struct_specifier": "struct",
-                        "enum_specifier": "enum"}[n.type]
+                        "enum_specifier": "enum", "union_specifier": "union"}[n.type]
                 symbols.append((txt(nm), kind, txt(n).split("{")[0].strip()[:120],
+                                line, n.end_point[0] + 1, "tree-sitter"))
+        # --- C 헤더의 실체는 '선언'이다. 정의만 뽑으면 헤더가 통째로 안 보인다.
+        elif n.type == "enumerator":
+            nm = n.child_by_field_name("name")
+            if nm is None:
+                nm = next((c for c in n.children if c.type == "identifier"), None)
+            if nm is not None:
+                symbols.append((txt(nm), "enum_constant", txt(n).strip()[:120],
+                                line, n.end_point[0] + 1, "tree-sitter"))
+        elif n.type == "type_definition":
+            # typedef enum {...} a_e;  /  typedef unsigned int id_t;
+            # 이름은 마지막 직계 type_identifier 다 (앞쪽 것은 원본 타입 이름).
+            names = [c for c in n.children if c.type == "type_identifier"]
+            if names:
+                symbols.append((txt(names[-1]), "typedef",
+                                txt(n).replace("\n", " ")[:120],
+                                line, n.end_point[0] + 1, "tree-sitter"))
+        elif n.type == "preproc_def":
+            nm = n.child_by_field_name("name")
+            if nm is not None and txt(nm) not in guard_names:
+                symbols.append((txt(nm), "macro", txt(n).replace("\n", " ")[:120],
+                                line, n.end_point[0] + 1, "tree-sitter"))
+        elif n.type == "preproc_function_def":
+            nm = n.child_by_field_name("name")
+            if nm is not None:
+                symbols.append((txt(nm), "macro_fn", txt(n).replace("\n", " ")[:120],
+                                line, n.end_point[0] + 1, "tree-sitter"))
+        elif n.type == "declaration" and not in_func:
+            # 함수 밖에서만 기록한다. 안 그러면 지역변수가 전부 심볼이 되어
+            # 노이즈로 못 쓰게 된다.
+            d = n.child_by_field_name("declarator")
+            is_proto = False
+            probe = d
+            for _ in range(8):
+                if probe is None:
+                    break
+                if probe.type == "function_declarator":
+                    is_proto = True
+                    break
+                probe = probe.child_by_field_name("declarator")
+            ident = _decl_ident(d) if d is not None else None
+            if ident is not None:
+                symbols.append((txt(ident),
+                                "prototype" if is_proto else "variable",
+                                txt(n).replace("\n", " ").strip()[:120],
                                 line, n.end_point[0] + 1, "tree-sitter"))
         elif n.type == "preproc_include":
             p = n.child_by_field_name("path")
@@ -693,7 +757,11 @@ def parse_c_cpp_ts(path: Path, text: str, lang: str):
         elif n.type in ("preproc_ifdef", "preproc_if"):
             # preproc_else/elif 는 기록하지 않는다 — 머리 노드 하나가
             # 조건부 그룹 전체를 대표한다. 안 그러면 한 그룹이 2~3번 세어진다.
-            if not _ts_is_include_guard(n, src):
+            if _ts_is_include_guard(n, src):
+                gnm = n.child_by_field_name("name")
+                if gnm is not None:
+                    guard_names.add(txt(gnm))
+            else:
                 cond = n.child_by_field_name("name")
                 gaps.append(("ifdef_branch", line,
                              "조건부 컴파일 %s — 어느 분기가 빌드되는지 알 수 없음"
@@ -702,10 +770,11 @@ def parse_c_cpp_ts(path: Path, text: str, lang: str):
         elif n.type in ("gnu_asm_expression", "asm_statement"):
             gaps.append(("inline_asm", line, "인라인 asm — 해석 불가", None))
 
+        child_in_func = in_func or n.type == "function_definition"
         for ch in n.children:
-            walk(ch, cur)
+            walk(ch, cur, child_in_func)
 
-    walk(tree.root_node, None)
+    walk(tree.root_node, None, False)
     return symbols, edges, gaps
 
 
@@ -914,6 +983,11 @@ lang: {lang}
 """
 
 
+# stub 하나에 적을 심볼 표의 최대 행 수. 칩 레지스터 헤더는 매크로가
+# 수천 개라 전부 적으면 파일 하나가 수백 KB가 된다.
+STUB_SYMBOL_LIMIT = 80
+
+
 def stub_rel(src_rel: str) -> str:
     return f"files/{src_rel}.md"
 
@@ -940,10 +1014,24 @@ def cmd_stubs(root: Path):
             "SELECT name, kind, signature, line_start FROM symbols "
             "WHERE file_id=? ORDER BY line_start", (fid,)).fetchall()
         if syms:
-            body.append("## 심볼 (기계 추출)\n\n| 이름 | 종류 | 위치 | 시그니처 |\n|---|---|---|---|\n")
-            for name, kind, sig, ls in syms:
+            from collections import Counter
+            by_kind = Counter(k for _n, k, _s, _l in syms)
+            summary = ", ".join(f"{k} {v}" for k, v in by_kind.most_common())
+            body.append(f"## 심볼 (기계 추출)\n\n총 {len(syms)}개 — {summary}\n\n")
+            # 칩 레지스터 헤더처럼 매크로가 수천 개인 파일이 있다. 전부 적으면
+            # stub 하나가 수백 KB가 되어 아무도 못 읽고 위키가 비대해진다.
+            # 상한을 두되, 몇 개를 생략했는지는 반드시 밝힌다.
+            shown = syms[:STUB_SYMBOL_LIMIT]
+            body.append("| 이름 | 종류 | 위치 | 시그니처 |\n|---|---|---|---|\n")
+            for name, kind, sig, ls in shown:
                 sig = (sig or "").replace("|", "\\|")
                 body.append(f"| `{name}` | {kind} | {path}:{ls} | `{sig}` |\n")
+            if len(syms) > len(shown):
+                body.append(
+                    f"\n> 위 표는 앞의 {len(shown)}개만 보여줍니다. "
+                    f"**{len(syms) - len(shown)}개 생략됨.**\n"
+                    f"> 생략된 것도 색인에는 다 들어 있습니다 — "
+                    f"`cw context <이름>` 으로 조회하세요.\n")
             body.append("\n")
         deps = cur.execute(
             "SELECT dst_name, dst_file, kind FROM edges WHERE src_file=? "

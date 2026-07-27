@@ -76,5 +76,83 @@ class TestTreeSitterParser(unittest.TestCase):
         self.assertEqual(sorted(calls), [("run", "init"), ("run", "step")])
 
 
+class TestHeaderDeclarations(unittest.TestCase):
+    """C 헤더는 대부분 '선언'이다. 정의만 뽑으면 헤더가 통째로 안 보인다.
+
+    실측 계기: 사내 코드에서 528개 파일이 참조하는 헤더
+    (typedef enum 만 들어있는 도메인 정의 파일)에서 심볼이 0개로 나왔다.
+    그러면 위키가 그 파일을 다룰 수도, 근거 주소를 달 수도 없다.
+    """
+
+    def setUp(self):
+        ok, reason = cw.ts_status()
+        if not ok:
+            self.skipTest(reason)
+
+    def kinds_of(self, src, lang="c"):
+        syms, _e, _g = cw.parse_c_cpp_ts(Path("h.h"), src, lang)
+        return {(s[0], s[1]) for s in syms}
+
+    def test_typedef_anonymous_enum(self):
+        """typedef enum { ... } name_e; — C 에서 가장 흔한 관용구."""
+        got = self.kinds_of(
+            "typedef enum {\n  APP_C_DOMAIN_NONE = 0,\n"
+            "  APP_C_DOMAIN_BODY,\n} app_c_domain_e;\n")
+        self.assertIn(("app_c_domain_e", "typedef"), got)
+        self.assertIn(("APP_C_DOMAIN_NONE", "enum_constant"), got)
+        self.assertIn(("APP_C_DOMAIN_BODY", "enum_constant"), got)
+
+    def test_named_enum_members(self):
+        got = self.kinds_of("enum color_e { RED, GREEN };\n")
+        self.assertIn(("color_e", "enum"), got)
+        self.assertIn(("RED", "enum_constant"), got)
+
+    def test_typedef_alias(self):
+        got = self.kinds_of("typedef unsigned int domain_id_t;\n")
+        self.assertIn(("domain_id_t", "typedef"), got)
+
+    def test_typedef_anonymous_struct(self):
+        got = self.kinds_of("typedef struct { int x; } point_t;\n")
+        self.assertIn(("point_t", "typedef"), got)
+
+    def test_function_prototype_is_not_a_definition(self):
+        """프로토타입은 정의가 아니다. kind 를 구분해야
+        '어디에 구현됐나'와 '어디에 선언됐나'를 섞지 않는다."""
+        got = self.kinds_of("int do_thing(int x);\n")
+        self.assertIn(("do_thing", "prototype"), got)
+        self.assertNotIn(("do_thing", "function"), got)
+
+    def test_object_and_function_macros(self):
+        got = self.kinds_of("#define MAX_DOMAIN 16\n#define SQ(x) ((x)*(x))\n")
+        self.assertIn(("MAX_DOMAIN", "macro"), got)
+        self.assertIn(("SQ", "macro_fn"), got)
+
+    def test_extern_global(self):
+        got = self.kinds_of("extern int g_domain_count;\n")
+        self.assertIn(("g_domain_count", "variable"), got)
+
+    def test_local_variables_are_not_symbols(self):
+        """함수 안의 지역변수까지 심볼로 잡으면 노이즈로 못 쓰게 된다."""
+        got = self.kinds_of(
+            "int f(void) {\n  int local_tmp = 1;\n  return local_tmp;\n}\n")
+        names = {n for n, _k in got}
+        self.assertIn("f", names)
+        self.assertNotIn("local_tmp", names)
+
+    def test_real_world_domain_header(self):
+        """사내에서 발견된 실제 모양 — 가드 + typedef enum 뿐인 헤더."""
+        src = ("#ifndef APP_C_DOMAIN_H_\n#define APP_C_DOMAIN_H_\n\n"
+               "typedef enum {\n    APP_C_DOMAIN_NONE = 0,\n"
+               "    APP_C_DOMAIN_BODY,\n    APP_C_DOMAIN_CHASSIS,\n"
+               "    APP_C_DOMAIN_MAX\n} app_c_domain_e;\n\n#endif\n")
+        syms, _e, gaps = cw.parse_c_cpp_ts(Path("app_c_domains.h"), src, "c")
+        self.assertGreaterEqual(
+            len(syms), 5,
+            f"528개 파일이 참조하는 헤더인데 심볼이 {len(syms)}개뿐이면 "
+            f"위키가 이 파일을 다룰 수 없다")
+        self.assertEqual([g for g in gaps if g[0] == "ifdef_branch"], [],
+                         "가드를 구멍으로 세면 안 된다")
+
+
 if __name__ == "__main__":
     unittest.main()
