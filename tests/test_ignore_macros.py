@@ -196,34 +196,11 @@ class TestConfigWiring(unittest.TestCase):
             self.assertIn("start_camera", names)
 
 
-class TestReportSuggestsConfig(unittest.TestCase):
-    """범인을 지목했으면 '무엇을 하라'까지 줘야 한다.
-
-    설계 §2.2-①: 사용자는 사내 출력을 반출할 수 없다. 화면에 나온 것을
-    그대로 붙여넣을 수 있어야 왕복이 한 번으로 끝난다.
-    """
-
-    def setUp(self):
-        ok, reason = cw.ts_status()
-        if not ok:
-            self.skipTest(reason)
-
-    def test_report_prints_pasteable_snippet(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            subprocess.run(["git", "init", "-q", str(root)], check=True)
-            for i in range(4):
-                (root / f"m{i}.c").write_text(
-                    "VENDOR_INLINE int f(int x) { return x; }\n",
-                    encoding="utf-8")
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                cw.cmd_init(root, show_next=False)
-                cw.cmd_index(root)
-                cw.cmd_parse_report(root)
-            out = buf.getvalue()
-            self.assertIn("ignore_macros", out)
-            self.assertIn("VENDOR_INLINE", out)
+# parse-report 가 범인 목록을 곧바로 붙여넣기용 설정으로 뱉게 했다가 걷어냈다.
+# 실측해보니 타입 이름으로 쓰이는 매크로(RTI_BOOL 등)를 지우면 함수가
+# 통째로 사라지는데, 목록만 봐서는 그런 매크로를 구분할 수 없었다.
+# 지금은 `cw try-macros` 가 하나씩 지워보고 안전한 것만 고른다.
+# → tests/test_try_macros.py
 
 
 if __name__ == "__main__":

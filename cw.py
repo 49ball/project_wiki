@@ -15,6 +15,7 @@ codewiki (cw.py) — 코드 프로젝트용 AI Wiki 툴킷의 결정론적 부�
   cw.py update --mark-done      AI 갱신 완료 후 현재 커밋을 기준점으로 기록
   cw.py status [경로]           색인 상태 요약
   cw.py parse-report [경로]     파서가 코드를 얼마나 읽어냈는지 진단 + 권고
+  cw.py try-macros [경로]       범인 매크로를 하나씩 지워보고 안전한 것만 고름
   cw.py log [경로] [--gaps]     기록장 — 위키에 없어서 코드를 열어본 질문
 
 설계 원칙:
@@ -2064,6 +2065,192 @@ PARSE_QUALITY_GAPS = ("parse_error", "parse_missing",
                       "macro_mangled_decl", "token_paste")
 
 
+# 문법이 깨진 자리에서 추출기가 심볼 이름으로 잘못 집어내는 키워드들.
+# 진짜 심볼 이름일 수 없으므로 '사라졌다'고 세면 안 된다.
+NOT_A_SYMBOL_NAME = {
+    "class", "struct", "enum", "union", "namespace", "template", "typedef",
+    "public", "private", "protected", "static", "const", "inline", "extern",
+    "void", "int", "char", "long", "short", "float", "double", "unsigned",
+    "signed", "bool", "auto", "using", "operator", "return", "if", "else",
+}
+
+
+def try_macro(files, name, base_ignore=()):
+    """매크로 하나를 실제로 지워보고 좋아지는지 나빠지는지 잰다.
+
+    files: [(Path, lang, text), ...]
+
+    겉모습으로는 구분할 수 없기 때문에 실측한다. 셋 다 그냥 대문자 단어다:
+
+      MEDIA_PUBLIC void f(int);      지우면 → 구멍 사라짐        (장식)
+      RTI_BOOL check_cert(int);      지우면 → **함수가 사라짐**  (타입)
+      MOCK_METHOD(int, run, (int));  지우면 → 구멍이 더 늘어남   (인자 받는)
+
+    판정 우선순위에서 '해로움'이 가장 세다. 다른 파일에서 아무리 이득이
+    나도 심볼을 하나라도 잃으면 넣으면 안 된다 — 위키에서 함수가 조용히
+    사라지는 것이 이 프로젝트가 가장 피하려는 일이다.
+    """
+    base = list(base_ignore)
+    before_syms, after_syms = set(), set()
+    gaps_before = gaps_after = 0
+    for path, lang, text in files:
+        s1, _e = parse_file(path, lang, text, base)
+        g1 = [g for g in _LAST_GAPS if g[0] in PARSE_QUALITY_GAPS]
+        s2, _e = parse_file(path, lang, text, base + [name])
+        g2 = [g for g in _LAST_GAPS if g[0] in PARSE_QUALITY_GAPS]
+        before_syms.update((path.as_posix(), x[0]) for x in s1)
+        after_syms.update((path.as_posix(), x[0]) for x in s2)
+        gaps_before += len(g1)
+        gaps_after += len(g2)
+
+    # 깨진 파싱은 `class`/`struct` 같은 키워드를 심볼 이름으로 뱉는다.
+    # 매크로를 지워 그게 사라지는 것은 손해가 아니라 이득이다. 이걸 손실로
+    # 세면 멀쩡한 장식 매크로가 '해로움'으로 잘못 막힌다.
+    lost = sorted({n for _f, n in before_syms - after_syms
+                   if n and n not in NOT_A_SYMBOL_NAME})
+    if lost:
+        verdict = "해로움"
+    elif gaps_after > gaps_before:
+        verdict = "역효과"
+    elif gaps_after < gaps_before:
+        verdict = "도움됨"
+    else:
+        verdict = "효과 없음"
+    return {"name": name, "verdict": verdict, "lost_symbols": lost,
+            "gaps_before": gaps_before, "gaps_after": gaps_after,
+            "n_files": len(files)}
+
+
+# 매크로 하나를 재려고 파일을 두 번씩 파싱한다. 사내 코드베이스는
+# 9,099 파일이라 전부 재면 너무 오래 걸린다. 표본으로도 판정은 갈린다.
+TRY_MACRO_FILE_CAP = 40
+
+
+def _spread(seq, k):
+    """seq 에서 최대 k개를 고르게 뽑는다.
+
+    앞에서 k개만 자르면 한 디렉터리에 몰려 같은 모양만 보게 된다.
+    표본이 한쪽으로 쏠리면 판정이 뒤집힌다.
+    """
+    if k <= 0:
+        return []
+    if len(seq) <= k:
+        return list(seq)
+    step = len(seq) / k
+    return [seq[int(i * step)] for i in range(k)]
+
+
+def cmd_try_macros(root: Path):
+    """범인 후보를 하나씩 지워보고, 안전하게 도움이 되는 것만 골라준다.
+
+    설계 §2.2-①: 사용자는 사내 출력을 반출할 수 없고 사내 AI는 판단력이
+    약하다. 그러므로 '알아서 판단해'가 아니라 기계가 실측해 결론을 낸다.
+    """
+    from collections import Counter
+    con = open_db(root)
+    cur = con.cursor()
+    cfg = load_config(root)
+    base = cfg.get("ignore_macros", [])
+
+    ph = ",".join("?" * len(PARSE_QUALITY_GAPS))
+    rows = cur.execute(
+        f"SELECT file, evidence FROM gaps WHERE kind IN ({ph}) "
+        "AND evidence IS NOT NULL AND evidence != ''",
+        PARSE_QUALITY_GAPS).fetchall()
+    if not rows:
+        print("판정할 후보가 없습니다. 먼저 `cw index` 를 실행하세요.")
+        return 0
+
+    counts, gap_files = Counter(), {}
+    for f, ev in rows:
+        for nm in [x for x in ev.split(",") if x and x not in base]:
+            counts[nm] += 1
+            gap_files.setdefault(nm, set()).add(f)
+
+    candidates = [nm for nm, _c in counts.most_common(12)]
+    print("## 후보 매크로를 하나씩 실제로 지워보는 중")
+    print(f"- 후보 {len(counts)}개 중 많이 나온 순으로 "
+          f"{len(candidates)}개를 잽니다")
+
+    # 잴 파일을 고른다. 구멍이 기록된 파일만 재면 안 된다 — 설정은 **모든**
+    # 파일에 적용되므로, 지금 멀쩡한 파일에서 나는 손해를 놓치게 된다.
+    # (실측: RTI_BOOL 은 구멍 난 파일에서는 이득이지만, 구멍 없는 파일에서는
+    #  반환 타입이 사라져 함수가 통째로 증발한다.)
+    # 그래서 그 이름이 '들어 있는' 파일을 전부 훑어 표본을 만든다.
+    word = {nm: re.compile(r"\b%s\b" % re.escape(nm)) for nm in candidates}
+    has_name = {nm: [] for nm in candidates}
+    for rel, lang in cur.execute(
+            "SELECT path, lang FROM files WHERE lang IN ('c','cpp')"):
+        p = root / rel
+        if not p.exists():
+            continue
+        try:
+            _raw, text, _enc = read_source(p)
+        except Exception:
+            continue
+        for nm in candidates:
+            if word[nm].search(text):
+                has_name[nm].append((rel, lang))
+
+    results = []
+    for nm in candidates:
+        found = has_name[nm]
+        # 구멍 난 파일(이득이 보이는 곳)과 멀쩡한 파일(손해가 숨은 곳)을
+        # 반씩 섞는다. 한쪽만 보면 판정이 뒤집힌다.
+        gapped = [x for x in found if x[0] in gap_files.get(nm, ())]
+        clean = [x for x in found if x[0] not in gap_files.get(nm, ())]
+        half = TRY_MACRO_FILE_CAP // 2
+        picked = (_spread(gapped, half) + _spread(clean, TRY_MACRO_FILE_CAP - half))
+        payload = []
+        for rel, lang in picked:
+            try:
+                _raw, text, _enc = read_source(root / rel)
+            except Exception:
+                continue
+            payload.append((root / rel, lang, text))
+        if payload:
+            results.append(try_macro(payload, nm, base))
+
+    good = [r for r in results if r["verdict"] == "도움됨"]
+    bad = [r for r in results if r["verdict"] == "해로움"]
+    other = [r for r in results if r["verdict"] in ("역효과", "효과 없음")]
+
+    if good:
+        print("\n## 넣어도 되는 것 (구멍이 줄고, 잃는 심볼이 없음)")
+        for r in good:
+            print(f"- {r['name']}: 구멍 {r['gaps_before']} → "
+                  f"{r['gaps_after']}곳 (파일 {r['n_files']}개 기준)")
+    if bad:
+        print("\n## 넣으면 안 되는 것 — 심볼이 사라집니다")
+        for r in bad:
+            ex = ", ".join(r["lost_symbols"][:3])
+            print(f"- {r['name']}: {len(r['lost_symbols'])}개 사라짐 (예: {ex})")
+        print("  → 타입 이름으로 쓰이는 매크로입니다. 지우면 반환 타입이")
+        print("    없어져서 파서가 함수인 줄 모르게 됩니다.")
+    if other:
+        print("\n## 넣어도 소용없는 것")
+        for r in other:
+            why = ("괄호가 남아 더 나빠짐" if r["verdict"] == "역효과"
+                   else "달라지는 것 없음")
+            print(f"- {r['name']}: {why}")
+        print("  → 인자를 받는 매크로는 이름만 지워서는 해결되지 않습니다.")
+        print("    이런 것은 구멍으로 남겨두는 게 맞습니다.")
+
+    print("\n" + "-" * 60)
+    if not good:
+        print("지워서 도움이 되는 매크로가 없습니다.")
+        print("남은 구멍은 매크로를 지우는 방식으로는 줄일 수 없습니다.")
+        return 0
+
+    print("## .codewiki/config.json 에 붙여넣으세요")
+    print('  "ignore_macros": '
+          + json.dumps(base + [r["name"] for r in good], ensure_ascii=False))
+    print("\n→ 넣고 `cw index` 후 `cw parse-report` 로 얼마나 줄었는지 보세요.")
+    print("→ 위 '넣어도 되는 것'은 실제로 지워보고 확인한 결과입니다. "
+          "추측이 아닙니다.")
+    return 0
+
+
 def cmd_parse_report(root: Path):
     """파서가 이 코드베이스를 얼마나 읽어냈는지 '결론'을 낸다.
 
@@ -2149,19 +2336,16 @@ def cmd_parse_report(root: Path):
         print("→ 이 목록을 개발자에게 그대로 전달하면 다음 작업을 정할 수 있습니다.")
 
         # 지목만 하고 끝내면 사용자가 '그래서 뭘 하지'에서 막힌다.
-        # 설계 §2.2-①: 사내 출력을 반출할 수 없으므로, 화면에 나온 것을
-        # 그대로 붙여넣어 스스로 해결할 수 있어야 왕복이 한 번으로 끝난다.
-        print("\n## 바로 해볼 것 — .codewiki/config.json 에 붙여넣으세요")
-        print('  "ignore_macros": '
-              + json.dumps([n for n, _c in top], ensure_ascii=False))
-        print("\n타입 자리 앞에 붙기만 하는 '장식' 매크로라면 이것만으로 읽힙니다.")
-        print("무엇으로 전개되는지는 알 필요 없습니다. 지우면 나머지가 읽힙니다.")
-        print("→ 넣고 `cw index` 를 다시 돌린 뒤 이 명령을 또 실행하면 "
-              "얼마나 줄었는지 보입니다.")
-        print("→ 줄지 않은 이름은 목록에서 빼세요. 인자를 받는 매크로"
-              "(예: FOO(a, b))는\n"
-              "   이름만 지워서는 낫지 않습니다. 그건 구멍으로 남겨두는 게 "
-              "맞습니다.")
+        # 그렇다고 이 목록을 그대로 붙여넣게 하면 안 된다 — 실측 결과
+        # 매크로 종류에 따라 결과가 정반대다. 타입 이름으로 쓰이는 매크로를
+        # 지우면 함수가 통째로 사라진다. 겉모습으로는 구분되지 않으므로
+        # 기계가 하나씩 지워보고 판정하는 명령으로 넘긴다.
+        print("\n## 바로 해볼 것")
+        print("  cw try-macros .")
+        print("\n위 이름들을 하나씩 실제로 지워보고, 안전하게 도움이 되는 것만")
+        print("골라서 설정에 붙여넣을 형태로 내줍니다.")
+        print("→ 이 목록을 그대로 설정에 넣지 마세요. 타입 이름으로 쓰이는")
+        print("  매크로가 섞여 있으면 위키에서 함수가 조용히 사라집니다.")
 
     print("\n## 다음에 할 일")
     for kind, _cnt in (quality + info)[:3]:
@@ -2254,7 +2438,7 @@ def main():
     ap.add_argument("command", choices=["setup", "init", "index", "stubs",
                                         "map", "lint", "update", "status",
                                         "doctor", "context", "coverage",
-                                        "parse-report", "log"])
+                                        "parse-report", "try-macros", "log"])
     ap.add_argument("path", nargs="?", default=".",
                     help="대상 프로젝트 루트 (기본: 현재 디렉터리)")
     ap.add_argument("query", nargs="?",
@@ -2303,6 +2487,8 @@ def main():
         cmd_doctor(root)
     elif args.command == "parse-report":
         sys.exit(cmd_parse_report(root))
+    elif args.command == "try-macros":
+        sys.exit(cmd_try_macros(root))
     elif args.command == "log":
         sys.exit(cmd_log(root, op=args.add, text=args.text,
                          result=args.result, gaps_only=args.gaps))
