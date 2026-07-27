@@ -54,6 +54,19 @@ DEFAULT_EXCLUDES = [
     ".idea", ".vscode",
 ]
 
+# 파일 이름 기준 제외 — 생성 코드와 코드 생성용 템플릿.
+# 사람이 문서화할 대상이 아니고, 파싱해봐야 오류만 쌓이며,
+# 파일 수를 부풀려 커버리지 비율까지 왜곡한다.
+# (.codewiki/config.json 의 "exclude_files" 로 덮어쓸 수 있다)
+DEFAULT_EXCLUDE_FILES = [
+    "*.pb.h", "*.pb.cc", "*.pb.c",        # protobuf 생성 코드
+    "*.pb-c.h", "*.pb-c.c",               # protobuf-c
+    "*.in.c", "*.in.h", "*.in.cpp", "*.in.hpp",   # 코드 생성 템플릿 (C 문법 아님)
+    "*_generated.h", "*_generated.cc",    # flatbuffers 등
+    "moc_*.cpp", "ui_*.h", "qrc_*.cpp",   # Qt 생성 코드
+    "*.pyc",
+]
+
 # ---------------------------------------------------------------- 공통 유틸
 
 def die(msg):
@@ -108,8 +121,14 @@ def is_excluded(rel_parts, patterns):
     return False
 
 
+_LAST_SKIPPED_GENERATED = 0   # 직전 iter_source_files 가 건너뛴 생성 코드 수
+
+
 def iter_source_files(root: Path, cfg: dict):
+    global _LAST_SKIPPED_GENERATED
+    _LAST_SKIPPED_GENERATED = 0
     excludes = cfg.get("exclude_dirs", DEFAULT_EXCLUDES)
+    file_excludes = cfg.get("exclude_files", DEFAULT_EXCLUDE_FILES)
     for dirpath, dirnames, filenames in os.walk(root):
         rel = Path(dirpath).relative_to(root)
         dirnames[:] = [d for d in dirnames
@@ -119,8 +138,12 @@ def iter_source_files(root: Path, cfg: dict):
             continue
         for fn in sorted(filenames):
             ext = Path(fn).suffix.lower()
-            if ext in LANG_BY_EXT:
-                yield Path(dirpath) / fn
+            if ext not in LANG_BY_EXT:
+                continue
+            if any(fnmatch.fnmatch(fn, pat) for pat in file_excludes):
+                _LAST_SKIPPED_GENERATED += 1
+                continue
+            yield Path(dirpath) / fn
 
 
 def db_path(root: Path) -> Path:
@@ -792,6 +815,21 @@ def parse_file(path: Path, lang: str, text: str):
         return parse_python(path, text)
     if lang in ("c", "cpp"):
         r = parse_c_cpp_ts(path, text, lang)
+        # `.h` 는 C 일 수도 C++ 일 수도 있다. 확장자만 믿으면 C++ 헤더를
+        # C 문법으로 읽어 오류가 쏟아진다(실측: 사내 코드 .h 1,356개가 C++).
+        # C 로 읽어 오류가 났을 때만 C++ 로 다시 읽고, 더 나은 쪽을 택한다.
+        # `.c` 는 재시도하지 않는다 — 거기까지 추측하면 진짜 C 오류를 숨긴다.
+        if (r is not None and lang == "c"
+                and path.suffix.lower() in (".h", ".hxx", ".hh")):
+            n_err = sum(1 for g in r[2]
+                        if g[0] in ("parse_error", "parse_missing"))
+            if n_err:
+                alt = parse_c_cpp_ts(path, text, "cpp")
+                if alt is not None:
+                    alt_err = sum(1 for g in alt[2]
+                                  if g[0] in ("parse_error", "parse_missing"))
+                    if alt_err < n_err:
+                        r = alt
         if r is not None:
             symbols, edges, gaps = r
             _LAST_GAPS = gaps
@@ -1801,6 +1839,10 @@ def cmd_doctor(root: Path):
     cfg = load_config(root)
     files = list(iter_source_files(root, cfg))
     print(f"\n## 색인 대상 훑기\n- 대상 파일: {len(files)}개")
+    if _LAST_SKIPPED_GENERATED:
+        print(f"- 생성 코드·템플릿 {_LAST_SKIPPED_GENERATED}개 제외됨 "
+              "(.pb.h, .in.c 등 — 사람이 문서화할 대상이 아님)")
+        print("  → 포함하려면 .codewiki/config.json 의 exclude_files 를 비우세요")
     from collections import Counter
     langs = Counter(LANG_BY_EXT[p.suffix.lower()] for p in files)
     print(f"- 언어별: {dict(langs)}")
