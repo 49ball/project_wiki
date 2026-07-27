@@ -1400,6 +1400,44 @@ def lint_notation(rel: str, body: str, root: Path, cur):
     return errors, warns
 
 
+# 요약 콜아웃에 쓸 표시 순서와 이름
+_SUMMARY_ORDER = [("confirmed", "✅", "확인"), ("inferred", "🔍", "추론"),
+                  ("sourced", "📄", "출처"), ("unknown", "❓", "모름"),
+                  ("caution", "⚠️", "주의")]
+RE_SUMMARY = re.compile(r'^> \[!info\] .*$', re.M)
+
+
+def summary_callout(body: str) -> str:
+    """문서의 신뢰도 구성을 한 줄로. 주장이 없으면 빈 문자열."""
+    from collections import Counter
+    counts = Counter(c.badge for c in parse_claims(body))
+    if not counts:
+        return ""
+    parts = [f"{ch}{name} {counts[grade]}"
+             for grade, ch, name in _SUMMARY_ORDER if counts.get(grade)]
+    return "> [!info] " + " · ".join(parts)
+
+
+def apply_summary(text: str) -> str:
+    """프론트매터 뒤에 요약 콜아웃을 삽입하거나 갱신한다. 멱등."""
+    fm_end = 0
+    if text.startswith("---"):
+        e = text.find("\n---", 3)
+        if e >= 0:
+            fm_end = e + 4
+            if text[fm_end:fm_end + 1] == "\n":
+                fm_end += 1
+
+    head, body = text[:fm_end], text[fm_end:]
+    body = RE_SUMMARY.sub("", body).lstrip("\n")   # 기존 요약 제거
+    line = summary_callout(body)
+    if not line:
+        return head + body
+    # 프론트매터가 있으면 사이에 빈 줄을 둔다 (--- 바로 밑에 붙으면 빡빡하다)
+    sep = "\n" if head else ""
+    return head + sep + line + "\n\n" + body
+
+
 RE_LABEL = re.compile(r'\^\[(confirmed|inferred|unknown)(?::\s*([^\]]+))?\]')
 RE_ANCHOR_LINE = re.compile(r'^(?P<path>[\w./+\-]+):(?P<l1>\d+)(?:-(?P<l2>\d+))?$')
 # sym: 접두어는 선택적이다. '#'이 있으면 심볼 앵커이므로 접두어가 중복이다.
@@ -1496,6 +1534,11 @@ def cmd_lint(root: Path):
         e, w = lint_notation(rel, body, root, cur)
         errors.extend(e)
         warns.extend(w)
+
+        # 요약 콜아웃은 기계 소유 — 검사하지 않고 갱신한다
+        new_text = apply_summary(text)
+        if new_text != text:
+            doc.write_text(new_text, encoding="utf-8")
 
         # 2) 프론트매터 필수 필드 (modules/flows/contracts/overview)
         if dtype in ("module", "flow", "contract", "overview", "note"):

@@ -109,5 +109,51 @@ class TestAnchorSymPrefixOptional(unittest.TestCase):
         self.assertIsNone(cw.RE_ANCHOR_SYM.match("src/hal/can.c:88"))
 
 
+class TestSummaryCallout(unittest.TestCase):
+
+    BODY = ("- ✅ 하나[^a]\n- ✅ 둘[^b]\n- 🔍 셋[^c]\n- ❓ 넷\n"
+            "\n[^a]: x\n[^b]: y\n[^c]: z\n")
+
+    def test_counts_by_badge(self):
+        line = cw.summary_callout(self.BODY)
+        self.assertIn("✅확인 2", line)
+        self.assertIn("🔍추론 1", line)
+        self.assertIn("❓모름 1", line)
+
+    def test_omits_zero_counts(self):
+        line = cw.summary_callout(self.BODY)
+        self.assertNotIn("📄", line, "0건인 배지는 적지 않는다")
+
+    def test_empty_when_no_claims(self):
+        self.assertEqual(cw.summary_callout("그냥 산문입니다.\n"), "")
+
+    def test_inserts_after_frontmatter(self):
+        text = "---\ntype: module\n---\n\n# 제목\n\n" + self.BODY
+        out = cw.apply_summary(text)
+        lines = out.split("\n")
+        self.assertEqual(lines[0], "---")
+        idx = next(i for i, l in enumerate(lines) if l.startswith("> [!info]"))
+        end_fm = next(i for i, l in enumerate(lines[1:], 1) if l == "---")
+        self.assertGreater(idx, end_fm, "프론트매터 뒤에 와야 한다")
+        self.assertLess(idx, lines.index("# 제목"), "제목 앞에 와야 한다")
+
+    def test_is_idempotent(self):
+        text = "---\ntype: module\n---\n\n" + self.BODY
+        once = cw.apply_summary(text)
+        twice = cw.apply_summary(once)
+        self.assertEqual(once, twice, "두 번 적용해도 같아야 한다")
+
+    def test_replaces_stale_summary(self):
+        text = ("---\ntype: module\n---\n\n"
+                "> [!info] ✅확인 99 · 🔍추론 99\n\n" + self.BODY)
+        out = cw.apply_summary(text)
+        self.assertNotIn("99", out)
+        self.assertIn("✅확인 2", out)
+
+    def test_no_frontmatter_still_works(self):
+        out = cw.apply_summary(self.BODY)
+        self.assertTrue(out.startswith("> [!info]"))
+
+
 if __name__ == "__main__":
     unittest.main()
