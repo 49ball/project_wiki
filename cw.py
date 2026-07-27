@@ -106,7 +106,8 @@ def run_git(root: Path, *args):
 
 def load_config(root: Path) -> dict:
     cfg_path = root / ".codewiki" / "config.json"
-    cfg = {"exclude_dirs": DEFAULT_EXCLUDES, "extra_source_dirs": []}
+    cfg = {"exclude_dirs": DEFAULT_EXCLUDES, "extra_source_dirs": [],
+           "ignore_macros": []}
     if cfg_path.exists():
         try:
             cfg.update(json.loads(cfg_path.read_text(encoding="utf-8")))
@@ -262,6 +263,37 @@ TRAILER_WORDS = {"const", "noexcept", "override", "final", "mutable",
 
 def _blank_keep_newlines(m):
     return "".join(c if c == "\n" else " " for c in m.group(0))
+
+
+def blank_macros(text, names):
+    """장식 매크로 이름을 같은 길이의 공백으로 지운다.
+
+    `MEDIA_PUBLIC void start_camera(int)` 처럼 타입 자리 앞에 붙는 매크로는
+    파서를 깨뜨려 선언 전체를 놓치게 만든다. 무엇으로 전개되는지는 알 필요가
+    없다 — 지우기만 하면 나머지가 그대로 읽힌다. (사내 실측: MEDIA_PUBLIC
+    1,002곳, ADSTDTFSIMD_FORCE_INLINE 254곳)
+
+    같은 길이의 공백으로 바꾸는 이유: 줄·열 번호가 원본과 어긋나면 구멍의
+    위치와 심볼의 줄 번호가 전부 틀어진다.
+
+    전처리기 지시문 줄(`#define`/`#ifdef`/`#undef`)은 건드리지 않는다.
+    정의 자체에서 이름을 지우면 그 줄이 새 오류가 된다.
+    """
+    if not names:
+        return text
+    names = [n for n in names if n]
+    if not names:
+        return text
+    # 긴 이름부터 — C_VEC_MEM 이 C_VEC_MEM_EXT 의 앞부분을 먼저 먹으면 안 된다
+    rx = re.compile(r"\b(?:%s)\b" % "|".join(
+        re.escape(n) for n in sorted(set(names), key=len, reverse=True)))
+    out = []
+    for line in text.split("\n"):
+        if line.lstrip().startswith("#"):
+            out.append(line)
+        else:
+            out.append(rx.sub(lambda m: " " * len(m.group(0)), line))
+    return "\n".join(out)
 
 
 def _match_back(s, i, close_ch, open_ch, limit_chars=6000):
@@ -843,16 +875,18 @@ def parse_c_cpp_ts(path: Path, text: str, lang: str):
 _LAST_GAPS = []   # 직전 parse_file 호출이 발견한 구멍. cmd_index 가 회수한다.
 
 
-def parse_file(path: Path, lang: str, text: str):
+def parse_file(path: Path, lang: str, text: str, ignore_macros=()):
     """(symbols, edges) 반환. 구멍은 _LAST_GAPS 에 남긴다.
 
     반환 시그니처를 바꾸지 않는 이유: cmd_doctor 등 기존 호출부를 깨지 않기 위함.
+    ignore_macros 도 같은 이유로 선택 인자다 (기본값 = 기존 동작).
     """
     global _LAST_GAPS
     _LAST_GAPS = []
     if lang == "python":
         return parse_python(path, text)
     if lang in ("c", "cpp"):
+        text = blank_macros(text, ignore_macros)
         r = parse_c_cpp_ts(path, text, lang)
         # `.h` 는 C 일 수도 C++ 일 수도 있다. 확장자만 믿으면 C++ 헤더를
         # C 문법으로 읽어 오류가 쏟아진다(실측: 사내 코드 .h 1,356개가 C++).
@@ -949,7 +983,8 @@ def cmd_index(root: Path, only_files=None):
         cur.execute("INSERT INTO files(path, sha, lang, loc) VALUES(?,?,?,?)",
                     (rel, sha, lang, loc))
         fid = cur.lastrowid
-        symbols, edges = parse_file(p, lang, text)
+        symbols, edges = parse_file(p, lang, text,
+                                    cfg.get("ignore_macros", []))
         for (name, kind, sig, ls, le, prov) in symbols:
             cur.execute("INSERT INTO symbols(file_id,name,kind,signature,"
                         "line_start,line_end,provenance) VALUES(?,?,?,?,?,?,?)",
@@ -1674,7 +1709,10 @@ def cmd_init(root: Path, show_next=True):
     if not cfg_p.exists():
         cfg_p.write_text(json.dumps(
             {"exclude_dirs": DEFAULT_EXCLUDES,
-             "_설명": "exclude_dirs: 색인에서 제외할 디렉터리 패턴"},
+             "ignore_macros": [],
+             "_설명": "exclude_dirs: 색인에서 제외할 디렉터리 패턴 / "
+                      "ignore_macros: 파싱 전에 지울 장식 매크로 이름 "
+                      "(cw parse-report 가 무엇을 넣을지 알려준다)"},
             indent=2, ensure_ascii=False), encoding="utf-8")
     # 이 저장소에서 작업하는 AI 에이전트가 위키를 자동으로 알게 하는 안내 파일
     agent_note = (
@@ -2109,6 +2147,21 @@ def cmd_parse_report(root: Path):
             print(f"\n→ 상위 3개({', '.join(n for n, _ in top[:3])})만 처리하면 "
                   f"약 {min(100, 100 * covered // max(total_q, 1))}%가 줄어듭니다.")
         print("→ 이 목록을 개발자에게 그대로 전달하면 다음 작업을 정할 수 있습니다.")
+
+        # 지목만 하고 끝내면 사용자가 '그래서 뭘 하지'에서 막힌다.
+        # 설계 §2.2-①: 사내 출력을 반출할 수 없으므로, 화면에 나온 것을
+        # 그대로 붙여넣어 스스로 해결할 수 있어야 왕복이 한 번으로 끝난다.
+        print("\n## 바로 해볼 것 — .codewiki/config.json 에 붙여넣으세요")
+        print('  "ignore_macros": '
+              + json.dumps([n for n, _c in top], ensure_ascii=False))
+        print("\n타입 자리 앞에 붙기만 하는 '장식' 매크로라면 이것만으로 읽힙니다.")
+        print("무엇으로 전개되는지는 알 필요 없습니다. 지우면 나머지가 읽힙니다.")
+        print("→ 넣고 `cw index` 를 다시 돌린 뒤 이 명령을 또 실행하면 "
+              "얼마나 줄었는지 보입니다.")
+        print("→ 줄지 않은 이름은 목록에서 빼세요. 인자를 받는 매크로"
+              "(예: FOO(a, b))는\n"
+              "   이름만 지워서는 낫지 않습니다. 그건 구멍으로 남겨두는 게 "
+              "맞습니다.")
 
     print("\n## 다음에 할 일")
     for kind, _cnt in (quality + info)[:3]:
