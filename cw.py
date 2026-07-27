@@ -1777,6 +1777,57 @@ def cmd_coverage(root: Path):
 
 # ---------------------------------------------------------------- context
 
+def uncertainties(root: Path, cur, query: str, def_files):
+    """'위키와 facts.db 만으로는 확신할 수 없는 것'을 규칙으로 판정한다.
+
+    AI 의 느낌이 아니라 데이터로 판정하므로 약한 모델도 쓸 수 있고
+    비용이 예측 가능해진다.
+    """
+    out = []
+    base = query.split("::")[-1]
+
+    rows = cur.execute(
+        "SELECT f.path, s.line_start FROM symbols s JOIN files f "
+        "ON f.id=s.file_id WHERE s.name=? OR s.name LIKE ? "
+        "ORDER BY f.path", (base, f"%::{base}")).fetchall()
+    if not rows:
+        out.append(
+            f"`{base}` 를 색인에서 찾지 못했습니다 — 위키에 없다면 "
+            f"코드에서 직접 찾아야 합니다 (매크로/템플릿 가능성)")
+    elif len(rows) > 1:
+        where = "  ".join(f"{p}:{l}" for p, l in rows[:5])
+        out.append(
+            f"`{base}` 이 {len(rows)}곳에 정의되어 있습니다 — "
+            f"어느 것인지 코드로 확인하세요\n     {where}")
+
+    # 파싱 실패 계열만 본다. ifdef/fnptr 은 코드의 성질이지 '못 읽음'이 아니라
+    # 여기 섞으면 거의 모든 파일이 걸려 목록이 노이즈가 된다.
+    if def_files:
+        ph = ",".join("?" * len(def_files))
+        qh = ",".join("?" * len(PARSE_QUALITY_GAPS))
+        for path, cnt in cur.execute(
+                f"SELECT file, COUNT(*) FROM gaps WHERE file IN ({ph}) "
+                f"AND kind IN ({qh}) GROUP BY file ORDER BY COUNT(*) DESC",
+                list(def_files) + list(PARSE_QUALITY_GAPS)):
+            out.append(
+                f"{path} 에 못 읽은 곳이 {cnt}곳 있습니다 — "
+                f"호출자·정의 목록이 불완전할 수 있습니다")
+
+    # 위키의 추론 문장 — 사실로 전달하면 안 되므로 확인 대상이다
+    if (root / "wiki").exists():
+        for doc in wiki_docs(root):
+            text = doc.read_text(encoding="utf-8", errors="replace")
+            _fm, body = parse_frontmatter(text)
+            if base not in body:
+                continue
+            for c in parse_claims(body):
+                if c.badge == "inferred" and base in c.text:
+                    out.append(
+                        f"위키 문장 \"{c.text[:40]}\" 은 추론입니다 "
+                        f"({doc.relative_to(root)}:{c.line}) — 확인 필요")
+    return out
+
+
 def cmd_context(root: Path, query: str):
     """심볼 이름(또는 파일 경로)에 대한 작업 컨텍스트를 조립해 출력.
     출력을 그대로 AI에게 주면 해당 심볼 작업에 필요한 지도가 된다."""
@@ -1847,6 +1898,15 @@ def cmd_context(root: Path, query: str):
         print("- 없음 — 이 심볼을 다루는 위키 문서가 아직 없음")
     for f in def_files:
         print(f"\n파일 stub: wiki/{stub_rel(f)}")
+
+    unc = uncertainties(root, cur, query, def_files)
+    print("\n## ⚠ 코드를 직접 확인해야 할 것\n")
+    if unc:
+        for i, u in enumerate(unc, 1):
+            print(f"{i}. {u}")
+        print("\n→ 이 목록에 있는 것만 코드를 여세요. 목록에 없으면 열지 마세요.")
+    else:
+        print("- 없음 — 위키와 색인만으로 답할 수 있습니다")
 
 
 # ---------------------------------------------------------------- doctor
