@@ -249,6 +249,7 @@ codewiki는 못 읽은 지점을 전부 기록합니다(`cw parse-report`로 확
 | `cw lint` | AI가 문서를 쓰거나 고친 뒤 검사 |
 | `cw context <함수이름>` | 특정 코드를 고치기 전 관련 정보 모으기 |
 | `cw coverage` | 위키가 어디를 다루고 어디가 비었는지 |
+| `cw log --gaps` | 위키에 없어서 코드를 열어본 질문 (다음 문서화 후보) |
 | `cw status` | 지금 상태 (파일 몇 개, 어느 커밋 기준인지) |
 | `cw map` / `index` / `stubs` | setup이 묶어서 해줌. 보통 직접 쓸 일 없음 |
 
@@ -346,10 +347,18 @@ AI에게는 좁고 명확한 일만 시킵니다. 모델이 약할수록 lint가
 **Q. Claude Code 스킬은 어떻게 설치하나요?**
 
 ```bash
-mkdir -p ~/.claude/skills && cp -r ~/codewiki/skill/codewiki ~/.claude/skills/
+mkdir -p ~/.claude/skills
+cp -r ~/codewiki/skill/* ~/.claude/skills/
 ```
 
-이후 "위키 만들어줘", "위키 갱신해줘", "기억해둬" 한마디로 전체 절차가 돌아갑니다.
+설치되는 스킬:
+
+| 스킬 | 언제 쓰이나 |
+|---|---|
+| `codewiki` | 위키 생성·갱신 ("위키 만들어줘", "기억해둬") |
+| `codewiki-query` | 코드에 대한 질문 ("이거 어떻게 동작해?", "지워도 돼?") |
+
+이후 말로만 시키면 전체 절차가 돌아갑니다.
 
 **Q. 인터넷이 안 되는 망분리 환경인데요?**
 `pip install`만 되면 됩니다. 그 외에는 인터넷을 쓰지 않습니다.
