@@ -1345,6 +1345,61 @@ def parse_footnotes(body: str):
     return out
 
 
+# 배지별로 각주가 필수인가. ⚠️(caution)는 선택.
+_BADGE_NEEDS_EVIDENCE = {
+    "confirmed": "코드 앵커",
+    "inferred": "추론의 근거",
+    "sourced": "출처(커밋·주석·사양서)",
+}
+
+
+def lint_notation(rel: str, body: str, root: Path, cur):
+    """표기법 검사. (errors, warns) 반환."""
+    errors, warns = [], []
+    claims = parse_claims(body)
+    notes = parse_footnotes(body)
+    used = set()
+
+    for c in claims:
+        used.update(c.refs)
+        need = _BADGE_NEEDS_EVIDENCE.get(c.badge)
+        if need and not c.refs:
+            badge_ch = next(k for k, v in BADGES.items() if v == c.badge)
+            errors.append(
+                f"{rel}:{c.line} {badge_ch} 주장에 {need}가 없음 — "
+                f"각주를 달거나 ❓로 낮추세요: \"{c.text[:30]}\"")
+        if c.badge == "unknown" and c.refs:
+            warns.append(
+                f"{rel}:{c.line} ❓인데 근거가 붙어 있음 — "
+                f"라벨이 잘못됐을 수 있습니다")
+        if len(c.refs) > 1:
+            warns.append(
+                f"{rel}:{c.line} 한 주장에 근거가 {len(c.refs)}개입니다. "
+                f"문장을 쪼개세요 — 어느 근거가 어느 부분을 뒷받침하는지 "
+                f"알 수 없습니다")
+        for r in c.refs:
+            if r not in notes:
+                errors.append(f"{rel}:{c.line} 각주 [^{r}] 의 정의가 없음")
+
+    for label in notes:
+        if label not in used:
+            warns.append(f"{rel} 쓰이지 않는 각주 정의 [^{label}] (고아)")
+
+    # 각주 정의 안의 앵커가 실존하는지
+    for label, definition in notes.items():
+        for m in re.finditer(r'`([^`]+)`', definition):
+            a = m.group(1)
+            if not (RE_ANCHOR_SYM.match(a) or RE_ANCHOR_LINE.match(a)):
+                continue
+            ok, msg = check_anchor(root, cur, a)
+            if ok is False:
+                errors.append(f"{rel} 각주 [^{label}] — {msg}")
+            elif ok is None:
+                warns.append(f"{rel} 각주 [^{label}] — {msg}")
+
+    return errors, warns
+
+
 RE_LABEL = re.compile(r'\^\[(confirmed|inferred|unknown)(?::\s*([^\]]+))?\]')
 RE_ANCHOR_LINE = re.compile(r'^(?P<path>[\w./+\-]+):(?P<l1>\d+)(?:-(?P<l2>\d+))?$')
 # sym: 접두어는 선택적이다. '#'이 있으면 심볼 앵커이므로 접두어가 중복이다.
@@ -1437,21 +1492,10 @@ def cmd_lint(root: Path):
         fm, body = parse_frontmatter(text)
         dtype = fm.get("type", "")
 
-        # 1) 라벨 검사
-        for m in RE_LABEL.finditer(body):
-            label, anchor = m.group(1), m.group(2)
-            line_no = text.count("\n", 0, text.find(m.group(0))) + 1
-            if label == "confirmed":
-                if not anchor:
-                    errors.append(f"{rel}:{line_no} confirmed 라벨에 근거 anchor가 "
-                                  f"없음 → inferred로 바꾸거나 anchor를 다세요")
-                    continue
-                for a in anchor.split(","):
-                    ok, msg = check_anchor(root, cur, a)
-                    if ok is False:
-                        errors.append(f"{rel}:{line_no} {msg}")
-                    elif ok is None:
-                        warns.append(f"{rel}:{line_no} {msg}")
+        # 1) 표기법 검사 (배지 + 각주)
+        e, w = lint_notation(rel, body, root, cur)
+        errors.extend(e)
+        warns.extend(w)
 
         # 2) 프론트매터 필수 필드 (modules/flows/contracts/overview)
         if dtype in ("module", "flow", "contract", "overview", "note"):
