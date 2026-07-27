@@ -24,6 +24,7 @@ codewiki (cw.py) — 코드 프로젝트용 AI Wiki 툴킷의 결정론적 부�
 
 import argparse
 import ast
+from collections import namedtuple
 import bisect
 import fnmatch
 import hashlib
@@ -1296,9 +1297,60 @@ def cmd_map(root: Path):
 
 # ---------------------------------------------------------------- lint
 
+# ---------------------------------------------------------------- 표기법
+# 신뢰도는 본문에 배지로 노출하고, 긴 앵커는 이름표 각주로 접는다.
+# 설계: docs/superpowers/specs/2026-07-27-confidence-notation-design.md
+
+BADGES = {
+    "✅": "confirmed",   # 코드에서 직접 확인. 앵커 필수
+    "🔍": "inferred",    # 정황 추론. 추론의 근거 필수
+    "📄": "sourced",     # 코드 밖에서 채굴(커밋·주석·사양서). 출처 필수
+    "❓": "unknown",     # 확인 못 함. 각주 없음
+    "⚠️": "caution",     # 함정·예외 (U+26A0 U+FE0F)
+    "⚠": "caution",      # 변이 선택자 없는 형태도 받는다
+}
+
+# 긴 것부터 정렬해야 ⚠️(2코드포인트)가 ⚠(1코드포인트)보다 먼저 매칭된다.
+# 반대로 두면 변이 선택자 U+FE0F 가 본문 앞에 남는다.
+_BADGE_ALT = "|".join(sorted((re.escape(b) for b in BADGES),
+                             key=len, reverse=True))
+RE_CLAIM = re.compile(r'^\s*[-*]\s+(' + _BADGE_ALT + r')\s*(.*)$')
+RE_FOOTREF = re.compile(r'\[\^([\w\-.]+)\]')
+RE_FOOTDEF = re.compile(r'^\[\^([\w\-.]+)\]:[ \t]*(.+)$')
+
+Claim = namedtuple("Claim", "line badge text refs")
+
+
+def parse_claims(body: str):
+    """배지가 붙은 주장 줄을 뽑는다. line 은 1부터."""
+    out = []
+    for i, line in enumerate(body.split("\n"), 1):
+        m = RE_CLAIM.match(line)
+        if not m:
+            continue
+        badge, rest = m.group(1), m.group(2)
+        refs = RE_FOOTREF.findall(rest)
+        text = RE_FOOTREF.sub("", rest).strip()
+        out.append(Claim(i, BADGES[badge], text, refs))
+    return out
+
+
+def parse_footnotes(body: str):
+    """각주 정의 수집. {라벨: 정의본문}. 줄 맨 앞에서 시작하는 것만."""
+    out = {}
+    for line in body.split("\n"):
+        m = RE_FOOTDEF.match(line)
+        if m:
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+
 RE_LABEL = re.compile(r'\^\[(confirmed|inferred|unknown)(?::\s*([^\]]+))?\]')
 RE_ANCHOR_LINE = re.compile(r'^(?P<path>[\w./+\-]+):(?P<l1>\d+)(?:-(?P<l2>\d+))?$')
-RE_ANCHOR_SYM = re.compile(r'^sym:(?P<path>[\w./+\-]+)#(?P<name>[\w:~]+)$')
+# sym: 접두어는 선택적이다. '#'이 있으면 심볼 앵커이므로 접두어가 중복이다.
+# 기존 문서 호환을 위해 sym: 형태도 계속 받는다.
+RE_ANCHOR_SYM = re.compile(
+    r'^(?:sym:)?(?P<path>[\w./+\-]+)#(?P<name>[\w:~]+)$')
 
 
 def parse_frontmatter(text: str):
