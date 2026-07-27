@@ -574,6 +574,35 @@ def ts_status():
 _TS_NAME_NODES = ("identifier", "field_identifier", "qualified_identifier",
                   "operator_name", "destructor_name", "type_identifier")
 
+# C 관례상 매크로는 대문자다. 파싱 오류가 난 줄의 대문자 식별자를 모으면
+# "무엇 때문에 못 읽었나"의 후보가 나온다. 완벽한 판별은 아니지만
+# "다음에 뭘 처리할지"를 정하는 데는 충분하다.
+_MACROISH_RE = re.compile(r"\b([A-Z][A-Z0-9_]{2,})\b")
+
+# 매크로 모양이지만 범인일 리 없는 흔한 상수·타입 — 빼지 않으면 목록이 이걸로 덮인다
+_MACROISH_IGNORE = {
+    "NULL", "TRUE", "FALSE", "EOF", "SEEK_SET", "SEEK_CUR", "SEEK_END",
+    "INT_MAX", "INT_MIN", "UINT_MAX", "LONG_MAX", "SIZE_MAX", "CHAR_BIT",
+    "UINT8_MAX", "UINT16_MAX", "UINT32_MAX", "UINT64_MAX",
+    "INT8_MAX", "INT16_MAX", "INT32_MAX", "INT64_MAX",
+    "M_PI", "RAND_MAX", "BUFSIZ", "STDIN_FILENO", "STDOUT_FILENO",
+    "STDERR_FILENO", "EXIT_SUCCESS", "EXIT_FAILURE",
+}
+
+
+def _culprit_macros(lines, line_idx):
+    """오류가 난 줄(과 바로 앞줄)에서 매크로 후보를 뽑는다.
+
+    선언이 여러 줄에 걸칠 수 있어 앞줄까지 본다.
+    """
+    lo = max(0, line_idx - 1)
+    ctx = "\n".join(lines[lo:line_idx + 1])
+    out = []
+    for m in _MACROISH_RE.findall(ctx):
+        if m not in _MACROISH_IGNORE and m not in out:
+            out.append(m)
+    return out[:4]      # 한 오류당 최대 4개까지만
+
 
 def _ts_is_include_guard(node, src):
     """인클루드 가드(#ifndef FOO_H / #define FOO_H)인가?
@@ -656,6 +685,7 @@ def parse_c_cpp_ts(path: Path, text: str, lang: str):
 
     symbols, edges, gaps = [], [], []
     guard_names = set()   # 인클루드 가드의 #define 은 심볼이 아니다
+    text_lines = text.split("\n")
 
     def txt(n):
         return src[n.start_byte:n.end_byte].decode("utf-8", "replace")
@@ -686,10 +716,12 @@ def parse_c_cpp_ts(path: Path, text: str, lang: str):
         if n.is_missing:
             gaps.append(("parse_missing", line,
                          "문법상 빠진 토큰 '%s' — 매크로 때문일 수 있음" % n.type,
-                         None))
+                         None,
+                         ",".join(_culprit_macros(text_lines, n.start_point[0]))))
         elif n.is_error:
             gaps.append(("parse_error", line,
-                         "이 구간을 문법으로 해석하지 못함", None))
+                         "이 구간을 문법으로 해석하지 못함", None,
+                         ",".join(_culprit_macros(text_lines, n.start_point[0]))))
 
         if n.type == "function_definition":
             name, mangled = _ts_decl_name(n, src)
@@ -701,7 +733,9 @@ def parse_c_cpp_ts(path: Path, text: str, lang: str):
             if mangled:
                 gaps.append(("macro_mangled_decl", line,
                              "매크로가 시그니처를 가림 — 실제 이름이 다를 수 있음",
-                             name))
+                             name,
+                             ",".join(_culprit_macros(text_lines,
+                                                      n.start_point[0]))))
         elif n.type in ("class_specifier", "struct_specifier", "enum_specifier",
                         "union_specifier"):
             nm = n.child_by_field_name("name")
@@ -772,11 +806,13 @@ def parse_c_cpp_ts(path: Path, text: str, lang: str):
                 if ch.type == "identifier":
                     gaps.append(("fnptr_table", ch.start_point[0] + 1,
                                  "%s — 테이블 등록. 호출로 잡히지 않음" % txt(ch),
-                                 None))
+                                 None, None))
         elif n.type == "preproc_arg":
             if "##" in txt(n):
                 gaps.append(("token_paste", line,
-                             "## 토큰 붙이기 — 생성되는 이름이 소스에 없음", None))
+                             "## 토큰 붙이기 — 생성되는 이름이 소스에 없음", None,
+                             ",".join(_culprit_macros(text_lines,
+                                                      n.start_point[0]))))
         elif n.type in ("preproc_ifdef", "preproc_if"):
             # preproc_else/elif 는 기록하지 않는다 — 머리 노드 하나가
             # 조건부 그룹 전체를 대표한다. 안 그러면 한 그룹이 2~3번 세어진다.
@@ -789,9 +825,10 @@ def parse_c_cpp_ts(path: Path, text: str, lang: str):
                 gaps.append(("ifdef_branch", line,
                              "조건부 컴파일 %s — 어느 분기가 빌드되는지 알 수 없음"
                              % (txt(cond) if cond is not None else n.type),
-                             None))
+                             None, None))
         elif n.type in ("gnu_asm_expression", "asm_statement"):
-            gaps.append(("inline_asm", line, "인라인 asm — 해석 불가", None))
+            gaps.append(("inline_asm", line, "인라인 asm — 해석 불가",
+                         None, None))
 
         child_in_func = in_func or n.type == "function_definition"
         for ch in n.children:
@@ -928,10 +965,10 @@ def cmd_index(root: Path, only_files=None):
                         (rel, src_sym, dst_name, dst_file, kind, prov, conf))
             n_edge += 1
         # 미해석 대장 — 파서가 못 읽은 지점. 설계 §6.3
-        for (gkind, gline, gdetail, gaffects) in _LAST_GAPS:
+        for (gkind, gline, gdetail, gaffects, gevid) in _LAST_GAPS:
             cur.execute("INSERT INTO gaps(file,line,kind,detail,affects_symbol,"
-                        "status) VALUES(?,?,?,?,?,'open')",
-                        (rel, gline, gkind, gdetail, gaffects))
+                        "status,evidence) VALUES(?,?,?,?,?,'open',?)",
+                        (rel, gline, gkind, gdetail, gaffects, gevid or None))
             n_gap += 1
     if show_progress:
         print(file=sys.stderr)
@@ -1787,6 +1824,30 @@ def cmd_parse_report(root: Path):
         print("\n## 코드의 성질 (판정에 반영 안 됨, 그러나 알아야 함)")
         for kind, cnt in info:
             print(f"- {GAP_LABEL.get(kind, kind)} ({kind}): {cnt}곳")
+
+    # 어떤 매크로 때문에 못 읽었는지를 이름으로 지목한다.
+    # "매크로 전개기가 필요합니다"만으로는 무엇을 처리할지 알 수 없다.
+    culprit = Counter()
+    n_with_evidence = 0
+    for (ev,) in cur.execute(
+            f"SELECT evidence FROM gaps WHERE kind IN ({ph}) "
+            "AND evidence IS NOT NULL AND evidence != ''", PARSE_QUALITY_GAPS):
+        names = [x for x in ev.split(",") if x]
+        if names:
+            n_with_evidence += 1
+        for nm in names:
+            culprit[nm] += 1
+    if culprit:
+        total_q = sum(c for _k, c in quality)
+        print("\n## 못 읽게 만든 범인 (많은 순)")
+        top = culprit.most_common(10)
+        for nm, cnt in top:
+            print(f"- {nm}: {cnt}곳")
+        covered = sum(c for _n, c in top[:3])
+        if total_q:
+            print(f"\n→ 상위 3개({', '.join(n for n, _ in top[:3])})만 처리하면 "
+                  f"약 {min(100, 100 * covered // max(total_q, 1))}%가 줄어듭니다.")
+        print("→ 이 목록을 개발자에게 그대로 전달하면 다음 작업을 정할 수 있습니다.")
 
     print("\n## 다음에 할 일")
     for kind, _cnt in (quality + info)[:3]:

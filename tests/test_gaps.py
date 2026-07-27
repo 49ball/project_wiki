@@ -57,7 +57,9 @@ class TestGapDetection(unittest.TestCase):
         _s, _e, gaps = cw.parse_c_cpp_ts(Path("t"), src, "c")
         self.assertTrue(gaps)
         for g in gaps:
-            self.assertEqual(len(g), 4, "(kind, line, detail, affects_symbol)")
+            self.assertEqual(
+                len(g), 5,
+                "(kind, line, detail, affects_symbol, evidence)")
             self.assertIsInstance(g[1], int)
 
     def test_fnptr_table_records_referenced_name(self):
