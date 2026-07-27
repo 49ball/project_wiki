@@ -15,6 +15,7 @@ codewiki (cw.py) — 코드 프로젝트용 AI Wiki 툴킷의 결정론적 부�
   cw.py update --mark-done      AI 갱신 완료 후 현재 커밋을 기준점으로 기록
   cw.py status [경로]           색인 상태 요약
   cw.py parse-report [경로]     파서가 코드를 얼마나 읽어냈는지 진단 + 권고
+  cw.py log [경로] [--gaps]     기록장 — 위키에 없어서 코드를 열어본 질문
 
 설계 원칙:
   - 코드는 절대 위키로 복사하지 않는다. anchor(경로:라인, sym:경로#이름)로 참조만 한다.
@@ -1909,6 +1910,68 @@ def cmd_context(root: Path, query: str):
         print("- 없음 — 위키와 색인만으로 답할 수 있습니다")
 
 
+# ---------------------------------------------------------------- log
+
+# 결과 문구에 이것이 들어 있으면 "위키에 없어서 코드를 봐야 했다"로 센다.
+LOG_MISS_MARK = "위키없음"
+
+
+def cmd_log(root: Path, op=None, text=None, result=None, gaps_only=False):
+    """기록장 append / 조회.
+
+    'query 가 코드를 열었다 = 위키에 없었다'가 핵심 신호다.
+    이것이 ingest 의 입력이 된다.
+    """
+    import datetime
+    p = root / "wiki" / "log.md"
+
+    if not p.exists():
+        print(f"기록장이 없습니다: {p} — 먼저 `cw init`을 실행하세요")
+        return 1
+
+    if op is not None:
+        day = datetime.date.today().isoformat()
+
+        def esc(s):
+            return (s or "").replace("|", "\\|").replace("\n", " ")
+
+        with p.open("a", encoding="utf-8") as f:
+            f.write(f"| {day} | {esc(op)} | {esc(text)} | {esc(result)} |\n")
+        return 0
+
+    rows = []
+    for line in p.read_text(encoding="utf-8").split("\n"):
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) < 4 or cells[0] == "날짜":
+            continue
+        if set(cells[0]) <= set("- "):      # 표 구분선
+            continue
+        rows.append(cells)
+
+    if gaps_only:
+        from collections import Counter
+        misses = Counter(r[2] for r in rows
+                         if r[1] == "query" and LOG_MISS_MARK in r[3])
+        if not misses:
+            print("위키에 없어서 코드를 열어본 질문이 아직 없습니다.")
+            return 0
+        print("## 위키에 없어서 코드를 열어본 질문 (많이 물어본 순)\n")
+        for i, (q, n) in enumerate(misses.most_common(20), 1):
+            print(f"  {i}. {q}  ({n}회 질문됨)")
+        print("\n→ 이것이 다음에 문서화할 후보입니다. `ingest` 에 넘기세요.")
+        return 0
+
+    if not rows:
+        print("기록이 아직 없습니다.")
+        return 0
+    print(f"## 최근 기록 (전체 {len(rows)}건)\n")
+    for r in rows[-20:]:
+        print(f"  {r[0]}  {r[1]:6}  {r[2][:40]:42}  {r[3][:30]}")
+    return 0
+
+
 # ---------------------------------------------------------------- doctor
 
 SELFTEST_CASES = [
@@ -2139,13 +2202,21 @@ def main():
     ap.add_argument("command", choices=["setup", "init", "index", "stubs",
                                         "map", "lint", "update", "status",
                                         "doctor", "context", "coverage",
-                                        "parse-report"])
+                                        "parse-report", "log"])
     ap.add_argument("path", nargs="?", default=".",
                     help="대상 프로젝트 루트 (기본: 현재 디렉터리)")
     ap.add_argument("query", nargs="?",
                     help="(context 전용) 심볼 이름 또는 파일 경로")
     ap.add_argument("--mark-done", action="store_true",
                     help="(update 전용) 위키 갱신 완료를 현재 커밋으로 기록")
+    # log 는 기존 'cw <명령> <경로>' 규칙을 지키려고 플래그를 쓴다.
+    # 위치 인자를 더 쓰면 path 가 'add' 로 잡혀 프로젝트 경로를 못 받는다.
+    ap.add_argument("--add", metavar="연산",
+                    help="(log 전용) 기록 추가 — query/ingest/lint")
+    ap.add_argument("--text", help="(log --add 전용) 기록할 내용")
+    ap.add_argument("--result", help="(log --add 전용) 결과 요약")
+    ap.add_argument("--gaps", action="store_true",
+                    help="(log 전용) 위키에 없어서 코드를 열어본 질문만")
     args = ap.parse_intermixed_args()
     root = Path(args.path).resolve()
     if args.command == "setup":
@@ -2180,6 +2251,9 @@ def main():
         cmd_doctor(root)
     elif args.command == "parse-report":
         sys.exit(cmd_parse_report(root))
+    elif args.command == "log":
+        sys.exit(cmd_log(root, op=args.add, text=args.text,
+                         result=args.result, gaps_only=args.gaps))
     elif args.command == "coverage":
         cmd_coverage(root)
     elif args.command == "context":
