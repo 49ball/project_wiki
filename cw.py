@@ -1439,7 +1439,6 @@ def apply_summary(text: str) -> str:
     return head + sep + line + "\n\n" + body
 
 
-RE_LABEL = re.compile(r'\^\[(confirmed|inferred|unknown)(?::\s*([^\]]+))?\]')
 RE_ANCHOR_LINE = re.compile(r'^(?P<path>[\w./+\-]+):(?P<l1>\d+)(?:-(?P<l2>\d+))?$')
 # sym: 접두어는 선택적이다. '#'이 있으면 심볼 앵커이므로 접두어가 중복이다.
 # 기존 문서 호환을 위해 sym: 형태도 계속 받는다.
