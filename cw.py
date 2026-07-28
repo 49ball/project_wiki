@@ -16,6 +16,7 @@ codewiki (cw.py) — 코드 프로젝트용 AI Wiki 툴킷의 결정론적 부�
   cw.py status [경로]           색인 상태 요약
   cw.py parse-report [경로]     파서가 코드를 얼마나 읽어냈는지 진단 + 권고
   cw.py try-macros [경로]       범인 매크로를 하나씩 지워보고 안전한 것만 고름
+  cw.py install-skills [경로]   Claude Code 스킬 설치 (setup 이 자동으로 해줌)
   cw.py log [경로] [--gaps]     기록장 — 위키에 없어서 코드를 열어본 질문
 
 설계 원칙:
@@ -1682,6 +1683,89 @@ def cmd_update(root: Path, mark_done=False):
 
 # ---------------------------------------------------------------- init/status
 
+def install_skills(dest: Path, src: Path = None):
+    """skill/* 를 dest 로 복사한다. (새로 깖, 갱신됨, 그대로) 이름 목록 반환.
+
+    내용이 같으면 건드리지 않는다. 매번 '갱신됨'이 뜨면 사용자가 그 줄을
+    무시하게 되고, 정작 진짜 갱신됐을 때 못 알아챈다.
+    """
+    src = src or (TOOLKIT_DIR / "skill")
+    new, updated, same = [], [], []
+    if not src.is_dir():
+        return new, updated, same          # 배포본에 skill/ 이 없어도 죽지 않는다
+    for skill_dir in sorted(p for p in src.iterdir() if p.is_dir()):
+        name = skill_dir.name
+        changed = fresh = False
+        for f in sorted(skill_dir.rglob("*")):
+            if not f.is_file():
+                continue
+            target = dest / name / f.relative_to(skill_dir)
+            body = f.read_bytes()
+            if not target.exists():
+                fresh = True
+            elif target.read_bytes() != body:
+                changed = True
+            else:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
+        if fresh:
+            new.append(name)
+        elif changed:
+            updated.append(name)
+        else:
+            same.append(name)
+    return new, updated, same
+
+
+def cmd_install_skills(root: Path, quiet=False):
+    """스킬을 프로젝트와 개인 홈 양쪽에 깐다.
+
+    - 프로젝트 `.claude/skills/` : 저장소를 받은 사람은 아무것도 안 해도 된다
+    - 개인 `~/.claude/skills/`   : 그 사람의 모든 프로젝트에서 동작한다
+
+    홈 폴더는 프로젝트 밖이므로 무엇을 어디에 썼는지 반드시 출력한다.
+    """
+    targets = [("프로젝트", root / ".claude" / "skills"),
+               ("개인", Path.home() / ".claude" / "skills")]
+    lines, any_change = [], False
+    for label, dest in targets:
+        try:
+            new, updated, same = install_skills(dest)
+        except OSError as e:
+            lines.append(f"- {label} {dest}: 설치 실패 ({e})")
+            continue
+        if not (new or updated or same):
+            continue
+        bits = []
+        if new:
+            bits.append("새로 깖: " + ", ".join(new))
+        if updated:
+            bits.append("갱신: " + ", ".join(updated))
+        if same:
+            bits.append("그대로: " + ", ".join(same))
+        any_change = any_change or bool(new or updated)
+        try:
+            shown = dest.relative_to(root)
+        except ValueError:
+            shown = dest
+        lines.append(f"- {label} {shown} — " + " / ".join(bits))
+
+    if not lines:
+        if not quiet:
+            print("설치할 스킬이 없습니다 (배포본에 skill/ 폴더가 없습니다)")
+        return 0
+    if quiet and not any_change:
+        return 0
+    print("\nClaude Code 스킬")
+    for line in lines:
+        print(line)
+    if any_change:
+        print("  → Claude Code 를 다시 켜면 인식됩니다. "
+              "이후 '위키 만들어줘' 한마디로 됩니다.")
+    return 0
+
+
 def cmd_init(root: Path, show_next=True):
     root = root.resolve()
     if not root.exists():
@@ -2438,7 +2522,8 @@ def main():
     ap.add_argument("command", choices=["setup", "init", "index", "stubs",
                                         "map", "lint", "update", "status",
                                         "doctor", "context", "coverage",
-                                        "parse-report", "try-macros", "log"])
+                                        "parse-report", "try-macros",
+                                        "install-skills", "log"])
     ap.add_argument("path", nargs="?", default=".",
                     help="대상 프로젝트 루트 (기본: 현재 디렉터리)")
     ap.add_argument("query", nargs="?",
@@ -2457,6 +2542,7 @@ def main():
     root = Path(args.path).resolve()
     if args.command == "setup":
         cmd_init(root, show_next=False)
+        cmd_install_skills(root, quiet=True)
         cmd_index(root)
         cmd_stubs(root)
         print("\n" + "=" * 60)
@@ -2489,6 +2575,8 @@ def main():
         sys.exit(cmd_parse_report(root))
     elif args.command == "try-macros":
         sys.exit(cmd_try_macros(root))
+    elif args.command == "install-skills":
+        sys.exit(cmd_install_skills(root))
     elif args.command == "log":
         sys.exit(cmd_log(root, op=args.add, text=args.text,
                          result=args.result, gaps_only=args.gaps))

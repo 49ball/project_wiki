@@ -190,7 +190,8 @@ cw parse-report
 ## 4단계 — AI에게 본문을 쓰게 하기
 
 **Claude Code처럼 명령을 실행할 수 있는 AI라면:**
-그냥 **"이 프로젝트 위키 만들어줘"** 라고 하세요. (스킬 설치는 아래 FAQ 참고)
+그냥 **"이 프로젝트 위키 만들어줘"** 라고 하세요.
+(스킬은 `cw setup` 이 이미 깔아뒀습니다. Claude Code를 한 번 다시 켜세요.)
 
 **채팅만 되는 AI(사내 챗봇 등)라면:**
 아래 두 파일 내용을 복사해서 붙여넣으세요.
@@ -313,6 +314,7 @@ codewiki는 못 읽은 지점을 전부 기록합니다(`cw parse-report`로 확
 | `cw setup` | 프로젝트에 처음 위키 만들 때 (딱 1번) |
 | `cw parse-report` | **setup 직후.** 파서가 얼마나 읽어냈는지 + 못 읽은 곳 |
 | `cw try-macros` | parse-report에 "범인 매크로"가 떴을 때. 지워도 되는 것만 골라줌 |
+| `cw install-skills` | Claude Code 스킬 재설치 (setup이 자동으로 해줌) |
 | `cw update` | 코드를 고친 뒤. 낡은 문서 찾기 |
 | `cw update --mark-done` | AI가 갱신을 마친 뒤 도장 찍기 |
 | `cw lint` | AI가 문서를 쓰거나 고친 뒤 검사 |
@@ -415,10 +417,23 @@ AI에게는 좁고 명확한 일만 시킵니다. 모델이 약할수록 lint가
 
 **Q. Claude Code 스킬은 어떻게 설치하나요?**
 
-```bash
-mkdir -p ~/.claude/skills
-cp -r ~/codewiki/skill/* ~/.claude/skills/
+**`cw setup` 이 알아서 깝니다.** 따로 하실 게 없습니다.
+
+처음 돌릴 때 이렇게 뜹니다.
+
 ```
+Claude Code 스킬
+- 프로젝트 .claude/skills — 새로 깖: codewiki, codewiki-query
+- 개인 /Users/나/.claude/skills — 새로 깖: codewiki, codewiki-query
+  → Claude Code 를 다시 켜면 인식됩니다. 이후 '위키 만들어줘' 한마디로 됩니다.
+```
+
+두 군데에 깔립니다.
+
+| 위치 | 효과 |
+|---|---|
+| 프로젝트 `.claude/skills/` | **이 저장소를 받은 사람은 아무것도 안 해도 됩니다** |
+| 개인 `~/.claude/skills/` | 내 모든 프로젝트에서 동작합니다 |
 
 설치되는 스킬:
 
@@ -427,7 +442,16 @@ cp -r ~/codewiki/skill/* ~/.claude/skills/
 | `codewiki` | 위키 생성·갱신 ("위키 만들어줘", "기억해둬") |
 | `codewiki-query` | 코드에 대한 질문 ("이거 어떻게 동작해?", "지워도 돼?") |
 
-이후 말로만 시키면 전체 절차가 돌아갑니다.
+**Claude Code를 다시 켜야 인식됩니다.** 이후 말로만 시키면 전체 절차가 돌아갑니다.
+
+이미 같은 내용이면 건드리지 않고 조용히 넘어갑니다. codewiki를 새 버전으로
+받았을 때만 "갱신"이라고 뜹니다.
+
+따로 다시 깔고 싶으면:
+
+```bash
+cw install-skills
+```
 
 **Q. 인터넷이 안 되는 망분리 환경인데요?**
 `pip install`만 되면 됩니다. 그 외에는 인터넷을 쓰지 않습니다.
