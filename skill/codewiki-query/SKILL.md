@@ -1,6 +1,6 @@
 ---
 name: codewiki-query
-description: Use when the user asks a question about how the code works, what something does, who calls what, whether something can be deleted, or where a feature starts — in a repo that has a wiki/ folder built by codewiki. Triggers include 이거 어떻게 동작해, 뭐하는 함수야, 누가 호출해, 지워도 돼, 어디서 시작해, 영향 범위, codewiki query.
+description: Use when the user asks a question about how the code works, what something does, who calls what, whether something can be deleted, or where a feature starts — either in a repo that has a wiki/ folder built by codewiki, OR from anywhere else while naming a codewiki project by path or name. Triggers include 이거 어떻게 동작해, 뭐하는 함수야, 누가 호출해, 지워도 돼, 어디서 시작해, 영향 범위, codewiki query, and the same questions prefixed with another project ("<경로> 프로젝트에서 …", "사내 코드 위키에서 …").
 ---
 
 # codewiki query — 위키와 색인으로 질문에 답한다
@@ -12,7 +12,16 @@ description: Use when the user asks a question about how the code works, what so
 
 ### 1. 재료를 모은다
 
-질문에서 심볼 이름을 뽑아 실행한다:
+먼저 `<프로젝트>`를 정한다. **현재 폴더일 필요가 없다** — 모든 명령이 경로를
+인자로 받으므로 어디에서든 다른 프로젝트에 질문할 수 있다.
+
+| 상황 | `<프로젝트>` |
+|---|---|
+| 지금 폴더에 `wiki/` 가 있다 | `.` |
+| 사용자가 경로를 말했다 | 그 경로 |
+| 사용자가 이름만 말했다 ("사내 코드") | 짐작하지 말고 **경로를 물어라** |
+
+그다음 질문에서 심볼 이름을 뽑아 실행한다:
 
 ```bash
 $CW context <프로젝트> <심볼>
