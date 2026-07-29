@@ -1272,27 +1272,63 @@ def _write_index(root: Path, cur):
 MAP_ENTRY_LIMIT = 40
 
 
-def _module_dirs(cur):
-    """디렉터리별 규모를 묶는다. map 과 lint 가 **같은 목록**을 봐야 한다.
+# 그룹이 이보다 많아지면 더 쪼개지 않는다. 목록이 길면 통째로 무시당한다.
+MODULE_GROUP_BUDGET = 60
 
-    목록이 서로 다르면 lint 가 "안 쓴 모듈이 있다"고 하는데 map 에는 그게
-    없어서 AI 가 무엇을 써야 할지 모르는 상태가 된다 — 영원히 안 끝난다.
+# 목표 그룹 수. 기준값을 저장소 크기에 맞추는 데 쓴다.
+MODULE_TARGET_GROUPS = 25
+
+
+def _module_dirs(cur):
+    """디렉터리를 모듈 후보로 묶는다. map 과 lint 가 **같은 목록**을 봐야 한다.
+
+    목록이 서로 다르면 lint 는 "안 덮인 폴더가 있다"는데 map 에는 그게 없어서
+    AI 가 무엇을 써야 할지 모르는 상태가 된다 — 영원히 안 끝난다.
+
+    깊이를 고정하면 안 된다. 가지마다 깊이가 다르기 때문이다. 1칸/2칸 고정
+    방식은 `src/modules/can/driver` 같은 트리를 `src/modules` 하나로 뭉갰다.
+    CAN·네트워크·보안이 한 덩어리가 되어 목록이 쓸모없어졌다.
+
+    그래서 **큰 것부터 쪼갠다**: 파일 수가 기준을 넘고 하위 폴더가 있으면
+    한 단계 내려간다. 기준값은 저장소 크기를 따라간다 — 9,099 파일짜리에
+    고정 기준을 쓰면 그룹이 수백 개가 되고, 12 파일짜리에 쓰면 1개가 된다.
     """
-    all_files = cur.execute("SELECT path, lang, loc FROM files").fetchall()
-    # 최상위 폴더가 너무 적으면(src 하나에 다 몰린 구조) 한 단계 더 파고든다.
-    depth = 1
-    tops = {p.split("/")[0] for (p, _, _) in all_files if "/" in p}
-    if len(tops) <= 3:
-        depth = 2
+    rows = cur.execute("SELECT path, lang, loc FROM files").fetchall()
+    if not rows:
+        return {}
+    target = max(MODULE_MIN_FILES, len(rows) // MODULE_TARGET_GROUPS)
+
+    pending = [("", [(p.split("/"), lang, loc) for p, lang, loc in rows])]
+    done = []
+    while pending:
+        pending.sort(key=lambda g: -len(g[1]))       # 큰 것부터
+        name, items = pending.pop(0)
+        children, own = {}, []
+        for parts, lang, loc in items:
+            if len(parts) > 1:
+                children.setdefault(parts[0], []).append((parts[1:], lang, loc))
+            else:
+                own.append((parts, lang, loc))
+        after = len(done) + len(pending) + len(children) + (1 if own else 0)
+        if (len(items) <= target or not children
+                or after > MODULE_GROUP_BUDGET):
+            done.append((name, items))
+            continue
+        # 하위 폴더와 나란히 있는 직속 파일은 자기 그룹을 갖는다.
+        # 안 그러면 어디에도 안 속해서 덮기 검사에서 샌다.
+        if own:
+            done.append((name, own))
+        for child, sub in children.items():
+            pending.append((f"{name}/{child}" if name else child, sub))
+
     dirs = {}
-    for (path, lang, loc) in all_files:
-        parts = path.split("/")
-        key = "/".join(parts[:depth]) if len(parts) > depth else \
-            ("/".join(parts[:-1]) or "(root)")
-        d = dirs.setdefault(key, {"files": 0, "loc": 0, "langs": set()})
-        d["files"] += 1
-        d["loc"] += loc
-        d["langs"].add(lang)
+    for name, items in done:
+        d = dirs.setdefault(name or "(root)",
+                            {"files": 0, "loc": 0, "langs": set()})
+        for _parts, lang, loc in items:
+            d["files"] += 1
+            d["loc"] += loc
+            d["langs"].add(lang)
     return dirs
 
 
