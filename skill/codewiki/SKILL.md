@@ -40,9 +40,22 @@ Obsidian 호환 위키를 만들고 증분 갱신하는 로컬 CLI다.
 
 작업 전에 반드시 `<proj>/wiki/conventions.md`를 읽고 그 규칙을 따르라.
 
-- **처음 위키 생성** ("위키 만들어줘", 온보딩 문서 요청):
-  `$CW setup <proj>` 실행 후, `~/codewiki/prompts/1-generate.md`를
-  읽고 그 절차대로 모듈/흐름/개요 문서를 작성하라.
+- **위키 생성·이어쓰기** ("위키 만들어줘", "위키 마저 써줘", 온보딩 문서 요청):
+
+  먼저 준비 상태를 확인하라. **이미 되어 있으면 setup 을 다시 돌리지 마라** —
+  setup 은 색인을 처음부터 다시 만든다. 파일이 수천 개면 몇 분을 그냥 버린다.
+
+  | `<proj>/.codewiki/facts.db` | 할 일 |
+  |---|---|
+  | 없다 | `$CW setup <proj>` |
+  | 있다 | `$CW map <proj>` 만 (색인은 이미 있다) |
+  | 있는데 코드가 바뀌었다 | `$CW index <proj>` 후 `$CW map <proj>` |
+
+  그다음 `~/codewiki/prompts/1-generate.md`를 읽고 그 절차대로
+  모듈/흐름/개요 문서를 작성하라.
+
+  **이미 쓰인 문서가 있으면 지우거나 다시 쓰지 마라.** `$CW lint <proj>` 가
+  알려주는 '문서가 없는 모듈'만 채워라. 그것이 이어쓰기다.
 - **코드 변경 후 갱신** ("위키 갱신", "코드 바꿨어"):
   `$CW update <proj>` 실행 → 출력된 stale 문서 목록에 대해
   `~/codewiki/prompts/2-update.md` 절차를 따르라.
