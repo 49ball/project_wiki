@@ -1272,11 +1272,12 @@ def _write_index(root: Path, cur):
 MAP_ENTRY_LIMIT = 40
 
 
-def cmd_map(root: Path):
-    con = open_db(root)
-    cur = con.cursor()
-    out = ["# 프로젝트 지도 (AI에게 이 파일 또는 .codewiki/map.md를 주면 됨)\n",
-           "\n## 디렉터리 = 모듈 후보\n\n"]
+def _module_dirs(cur):
+    """디렉터리별 규모를 묶는다. map 과 lint 가 **같은 목록**을 봐야 한다.
+
+    목록이 서로 다르면 lint 가 "안 쓴 모듈이 있다"고 하는데 map 에는 그게
+    없어서 AI 가 무엇을 써야 할지 모르는 상태가 된다 — 영원히 안 끝난다.
+    """
     all_files = cur.execute("SELECT path, lang, loc FROM files").fetchall()
     # 최상위 폴더가 너무 적으면(src 하나에 다 몰린 구조) 한 단계 더 파고든다.
     depth = 1
@@ -1292,9 +1293,35 @@ def cmd_map(root: Path):
         d["files"] += 1
         d["loc"] += loc
         d["langs"].add(lang)
+    return dirs
+
+
+def module_candidates(cur):
+    """[(디렉터리, 파일수, 줄수)] — 규모 큰 순. 문서화해야 할 대상 목록이다."""
+    dirs = _module_dirs(cur)
+    return [(name, dirs[name]["files"], dirs[name]["loc"])
+            for name in sorted(dirs, key=lambda k: -dirs[k]["loc"])]
+
+
+# 파일이 이보다 적은 폴더는 모듈 문서를 강제하지 않는다.
+# 한두 개짜리 폴더까지 에러로 만들면 목록이 노이즈가 되어 통째로 무시당한다.
+MODULE_MIN_FILES = 2
+
+
+def cmd_map(root: Path):
+    con = open_db(root)
+    cur = con.cursor()
+    out = ["# 프로젝트 지도 (AI에게 이 파일 또는 .codewiki/map.md를 주면 됨)\n",
+           "\n## 디렉터리 = 모듈 후보\n\n"]
+    dirs = _module_dirs(cur)
+    todo = [n for n, f, _l in module_candidates(cur) if f >= MODULE_MIN_FILES]
+    out.append(f"**문서화 대상 {len(todo)}개.** 이 목록은 '후보'가 아니라 "
+               "체크리스트다.\n"
+               "골라 쓰지 말고 전부 다뤄라. 빠뜨리면 `cw lint` 가 에러로 잡는다.\n\n")
     for name in sorted(dirs, key=lambda k: -dirs[k]["loc"]):
         d = dirs[name]
-        out.append(f"- `{name}/` : {d['files']}개 파일, {d['loc']}줄, "
+        mark = "[ ] " if d["files"] >= MODULE_MIN_FILES else "     "
+        out.append(f"- {mark}`{name}/` : {d['files']}개 파일, {d['loc']}줄, "
                    f"언어={','.join(sorted(d['langs']))}\n")
     out.append("\n## 변경 파급이 큰 파일 (fan-in 상위)\n\n")
     for path, c in _fan_in(cur):
@@ -1560,6 +1587,7 @@ def cmd_lint(root: Path):
     errors, warns = [], []
     head = run_git(root, "rev-parse", "--short", "HEAD")
     diff_cache = {}
+    covered_globs = []
 
     for doc in wiki_docs(root):
         rel = str(doc.relative_to(root))
@@ -1588,6 +1616,8 @@ def cmd_lint(root: Path):
         deps = fm.get("depends", [])
         if isinstance(deps, str):
             deps = [deps]
+        if dtype in ("module", "flow", "contract", "note"):
+            covered_globs.extend(deps)
         if head and va and isinstance(va, str) and va not in ("TBD", ""):
             if va not in diff_cache:
                 out = run_git(root, "diff", "--name-only", f"{va}..HEAD")
@@ -1606,13 +1636,44 @@ def cmd_lint(root: Path):
                     errors.append(f"{rel} ⏰ STALE — validated_at={va} 이후 의존 "
                                   f"파일 변경됨: {', '.join(sorted(hits)[:5])}")
 
+    # 4) 완성도 — 아직 아무 문서도 다루지 않는 모듈이 남아 있는가
+    #
+    # 계기: 모듈 12개짜리 코드베이스에서 AI가 2개만 쓰고 끝내버렸다.
+    # 표기법이 아무리 깨끗해도 10개가 비어 있으면 그 위키는 실패작이다.
+    # 설계 §2.2-①대로, '충분한가'를 AI가 판단하게 두지 않고 기계가 센다.
+    missing = []
+    for name, n_files, n_loc in module_candidates(cur):
+        if n_files < MODULE_MIN_FILES:
+            continue
+        probe = f"{name}/x.c" if name != "(root)" else "x.c"
+        # 경계를 지켜 비교한다. 단순 startswith 로 하면 `src/mod11` 을 쓴 것이
+        # `src/mod1` 까지 다뤄진 걸로 세어, 빠진 모듈이 조용히 통과한다.
+        # 완성도 검사가 완성도를 속이는 셈이라 가장 나쁜 종류의 버그다.
+        if any(fnmatch.fnmatch(probe, g) or g == name
+               or g.startswith(name + "/")
+               for g in covered_globs):
+            continue
+        missing.append((name, n_files, n_loc))
+    if missing:
+        total = sum(1 for _n, f, _l in module_candidates(cur)
+                    if f >= MODULE_MIN_FILES)
+        errors.append(
+            f"모듈 {total}개 중 {len(missing)}개를 다루는 문서가 없습니다 "
+            f"— 위키가 아직 덜 쓰였습니다")
+        for name, n_files, n_loc in missing:
+            errors.append(f"  {name}/ ({n_files}개 파일, {n_loc}줄) "
+                          f"를 다루는 모듈 문서가 없음")
+
     for e in errors:
         print("에러:", e)
     for w in warns:
         print("경고:", w)
     print(f"\nlint 결과: 에러 {len(errors)}건, 경고 {len(warns)}건"
           f" (문서 {len(list(wiki_docs(root)))}개 검사)")
-    sys.exit(1 if errors else 0)
+    if missing:
+        print("→ 남은 모듈을 전부 문서화해야 합니다. 골라 쓰는 것이 아닙니다.")
+        print("  대상 목록: `cw map` 또는 .codewiki/map.md 의 체크리스트")
+    return 1 if errors else 0
 
 # ---------------------------------------------------------------- update
 
@@ -2564,7 +2625,7 @@ def main():
     elif args.command == "map":
         cmd_map(root)
     elif args.command == "lint":
-        cmd_lint(root)
+        sys.exit(cmd_lint(root))
     elif args.command == "update":
         cmd_update(root, mark_done=args.mark_done)
     elif args.command == "status":
