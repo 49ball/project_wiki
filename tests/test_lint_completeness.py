@@ -170,6 +170,26 @@ class TestLintCatchesUnfinished(unittest.TestCase):
             _code, out = self.lint(root)
             self.assertIn("5", out)
 
+    def test_one_doc_may_cover_many_directories(self):
+        """폴더 수 = 모듈 수가 아니다. 묶어서 덮는 것이 허용돼야 한다.
+
+        기계는 '몇 개의 모듈로 나눌지'를 지시하지 않는다. 경계는 의미의
+        문제라 사람이 정한다. 기계는 빠진 폴더가 없는지만 본다.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _make_repo(root, {"src/can": 3, "src/net": 3, "src/sec": 3})
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cw.cmd_init(root, show_next=False)
+                cw.cmd_index(root)
+            _write_module_doc(root, "통신", ["src/can/*", "src/net/*"])
+            _write_module_doc(root, "보안", ["src/sec/*"])
+            code, out = self.lint(root)
+            self.assertNotIn("덮이지 않", out,
+                             "3개 폴더를 2개 문서로 덮은 것은 정상이다")
+            self.assertEqual(code, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

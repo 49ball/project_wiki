@@ -1315,9 +1315,13 @@ def cmd_map(root: Path):
            "\n## 디렉터리 = 모듈 후보\n\n"]
     dirs = _module_dirs(cur)
     todo = [n for n, f, _l in module_candidates(cur) if f >= MODULE_MIN_FILES]
-    out.append(f"**문서화 대상 {len(todo)}개.** 이 목록은 '후보'가 아니라 "
-               "체크리스트다.\n"
-               "골라 쓰지 말고 전부 다뤄라. 빠뜨리면 `cw lint` 가 에러로 잡는다.\n\n")
+    out.append(f"**아래 `[ ]` 표시된 {len(todo)}개 폴더가 빠짐없이 덮여야 한다.**\n\n"
+               "폴더 수 = 모듈 수가 아니다. **몇 개의 모듈로 나눌지, 어느 깊이로\n"
+               "쓸지는 네가(또는 사용자가) 정한다.** 의미가 맞으면 여러 폴더를\n"
+               "한 모듈로 묶어라 — 그게 더 나은 경우가 많다.\n\n"
+               "기계가 보는 것은 하나뿐이다: **빠진 폴더가 있는가.**\n"
+               "묶었으면 그 문서의 `depends` 에 묶은 경로를 전부 적어야\n"
+               "덮인 것으로 인식된다. 남으면 `cw lint` 가 에러로 잡는다.\n\n")
     for name in sorted(dirs, key=lambda k: -dirs[k]["loc"]):
         d = dirs[name]
         mark = "[ ] " if d["files"] >= MODULE_MIN_FILES else "     "
@@ -1618,6 +1622,14 @@ def cmd_lint(root: Path):
             deps = [deps]
         if dtype in ("module", "flow", "contract", "note"):
             covered_globs.extend(deps)
+            # 덮기만 하고 내용이 없는 문서를 잡는다. '덮이지 않은 폴더' 검사가
+            # 생기면서 `- ❓ 아직 안 씀` 한 줄로 에러만 지우는 길이 열렸다.
+            # 에러가 아니라 경고인 이유: ✅ 를 강제하면 근거 없는 확신을
+            # 지어내게 된다. 모르는 것을 ❓ 로 두는 선택 자체는 정당하다.
+            if not [c for c in parse_claims(body)
+                    if c.badge in ("confirmed", "inferred", "sourced")]:
+                warns.append(f"{rel} 내용이 없습니다 — 확인(✅)·추론(🔍)·"
+                             f"출처(📄) 주장이 하나도 없음")
         if head and va and isinstance(va, str) and va not in ("TBD", ""):
             if va not in diff_cache:
                 out = run_git(root, "diff", "--name-only", f"{va}..HEAD")
@@ -1658,11 +1670,11 @@ def cmd_lint(root: Path):
         total = sum(1 for _n, f, _l in module_candidates(cur)
                     if f >= MODULE_MIN_FILES)
         errors.append(
-            f"모듈 {total}개 중 {len(missing)}개를 다루는 문서가 없습니다 "
-            f"— 위키가 아직 덜 쓰였습니다")
+            f"{len(missing)}개 폴더가 어느 문서에도 덮이지 않았습니다 "
+            f"(전체 {total}개) — 위키가 아직 덜 쓰였습니다")
         for name, n_files, n_loc in missing:
             errors.append(f"  {name}/ ({n_files}개 파일, {n_loc}줄) "
-                          f"를 다루는 모듈 문서가 없음")
+                          f"를 덮는 문서가 없음")
 
     for e in errors:
         print("에러:", e)
@@ -1671,8 +1683,9 @@ def cmd_lint(root: Path):
     print(f"\nlint 결과: 에러 {len(errors)}건, 경고 {len(warns)}건"
           f" (문서 {len(list(wiki_docs(root)))}개 검사)")
     if missing:
-        print("→ 남은 모듈을 전부 문서화해야 합니다. 골라 쓰는 것이 아닙니다.")
-        print("  대상 목록: `cw map` 또는 .codewiki/map.md 의 체크리스트")
+        print("→ 위 폴더들을 덮어야 합니다. 몇 개의 모듈로 묶을지는 자유이고,")
+        print("  깊이도 자유입니다. 다만 빠지는 폴더가 없어야 합니다.")
+        print("  전체 목록: `cw map` 또는 .codewiki/map.md")
     return 1 if errors else 0
 
 # ---------------------------------------------------------------- update
