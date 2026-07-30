@@ -1793,6 +1793,65 @@ def cmd_update(root: Path, mark_done=False):
 
 # ---------------------------------------------------------------- init/status
 
+AGENT_NOTE_BEGIN = "<!-- codewiki:begin -->"
+AGENT_NOTE_END = "<!-- codewiki:end -->"
+
+
+def agent_note_block(root: Path) -> str:
+    """CLAUDE.md / AGENTS.md 에 넣을 안내 블록.
+
+    **빈칸을 남기지 않는다.** 전에는 `python3 <codewiki>/cw.py` 처럼 자리표시자를
+    적어놔서, 새 세션마다 AI 가 cw.py 를 찾아 헤맸다. CLAUDE.md 는 세션이
+    시작될 때 자동으로 읽히므로, 여기에 **그대로 실행되는 명령**을 적어두면
+    탐색이 아예 필요 없다. 프로젝트 경로도 적어 되묻지 않게 한다.
+    """
+    cw_path = TOOLKIT_DIR / "cw.py"
+    proj = root.resolve()
+    return (
+        f"{AGENT_NOTE_BEGIN}\n"
+        "## 프로젝트 지식 위키 (AI 에이전트용 — codewiki)\n\n"
+        "이 저장소에는 codewiki가 관리하는 지식층이 있다. 코드를 뒤지기 전에\n"
+        "여기를 먼저 보라. 아래 명령은 그대로 복사해 실행하면 된다.\n\n"
+        f"툴킷 경로는 이미 알고 있다. **찾지 마라.**\n\n"
+        f"```bash\n"
+        f"cw() {{ python3 {cw_path} \"$@\"; }}\n"
+        f"```\n\n"
+        f"(`CW=\"python3 ...\"` 형태는 zsh 에서 단어 분리가 안 돼 실패한다. "
+        f"함수를 써라.)\n\n"
+        f"이 프로젝트: `{proj}`\n"
+        "아래는 프로젝트 루트에서 실행한다. 다른 위치라면 `.` 대신 위 경로를 쓴다.\n\n"
+        "| 하려는 일 | 명령 |\n"
+        "|---|---|\n"
+        f"| 심볼의 정의·호출자·관련 문서 | `cw context . <심볼이름>` |\n"
+        f"| 파서가 못 읽은 곳 확인 | `cw parse-report .` |\n"
+        f"| 위키 검사 | `cw lint .` |\n"
+        f"| 코드 변경 후 낡은 문서 찾기 | `cw update .` |\n\n"
+        "읽을 것:\n\n"
+        "- 전체 구조: `wiki/00-overview.md` → 상세: `wiki/modules/`, `wiki/flows/`\n"
+        "- 왜·함정: `wiki/decisions/`, `wiki/notes/` (코드에 없는 지식)\n"
+        "- 프로젝트 지도: `.codewiki/map.md`\n"
+        "- 위키 수정 시 규칙: `wiki/conventions.md` (배지·각주 필수)\n\n"
+        "색인에 없다 = \"확인 못 함\"이지 \"존재하지 않음\"이 아니다.\n"
+        f"{AGENT_NOTE_END}\n"
+    )
+
+
+def merge_agent_note(old: str, block: str) -> str:
+    """기존 파일에 블록을 끼워넣거나 갱신한다.
+
+    기존 내용을 지우지 않는다 — 그 프로젝트의 규칙이 적혀 있을 수 있다.
+    표시자로 감싸서 반복 실행해도 블록이 하나만 남게 한다.
+    """
+    if old is None:
+        return block
+    if AGENT_NOTE_BEGIN in old and AGENT_NOTE_END in old:
+        head = old.split(AGENT_NOTE_BEGIN)[0]
+        tail = old.split(AGENT_NOTE_END, 1)[1]
+        return head + block.rstrip("\n") + tail
+    sep = "" if old.endswith("\n\n") else ("\n" if old.endswith("\n") else "\n\n")
+    return old + sep + block
+
+
 def install_skills(dest: Path, src: Path = None):
     """skill/* 를 dest 로 복사한다. (새로 깖, 갱신됨, 그대로) 이름 목록 반환.
 
@@ -1910,23 +1969,16 @@ def cmd_init(root: Path, show_next=True):
                       "(cw parse-report 가 무엇을 넣을지 알려준다)"},
             indent=2, ensure_ascii=False), encoding="utf-8")
     # 이 저장소에서 작업하는 AI 에이전트가 위키를 자동으로 알게 하는 안내 파일
-    agent_note = (
-        "# 프로젝트 지식 위키 안내 (AI 에이전트용)\n\n"
-        "이 저장소에는 codewiki가 관리하는 지식층이 있다. 작업 전에 활용하라:\n\n"
-        "- 전체 구조: `wiki/00-overview.md` → 상세: `wiki/modules/`, `wiki/flows/`\n"
-        "- 프로젝트 지도: `.codewiki/map.md` (모듈 후보·핵심 파일·엔트리포인트)\n"
-        "- 특정 심볼/파일 작업 전: `python3 <codewiki>/cw.py context . <심볼이름>`\n"
-        "- 위키 수정 시 규칙: `wiki/conventions.md` (라벨·anchor 필수)\n"
-        "- 코드 변경 후: `python3 <codewiki>/cw.py update .` 로 낡은 문서 확인·갱신\n"
-    )
+    agent_note = agent_note_block(root)
     for fname in ("CLAUDE.md", "AGENTS.md"):
         p = root / fname
-        if not p.exists():
-            p.write_text(agent_note, encoding="utf-8")
-            print(f"  {fname} 생성 (AI 에이전트용 위키 안내)")
-        elif "codewiki" not in p.read_text(encoding="utf-8", errors="replace"):
-            print(f"  참고: {fname}가 이미 있음 — 위키 안내 단락을 직접 추가하면 "
-                  f"에이전트가 위키를 자동 활용함")
+        old = p.read_text(encoding="utf-8", errors="replace") \
+            if p.exists() else None
+        new = merge_agent_note(old, agent_note)
+        if new != old:
+            p.write_text(new, encoding="utf-8")
+            print(f"  {fname} {'갱신' if old else '생성'} "
+                  f"(AI 에이전트용 위키 안내)")
     print(f"초기화 완료: {root}")
     print(f"  wiki/ 에 템플릿 {len(copied)}개 설치 (Obsidian에서 wiki/를 vault로 여세요)")
     if show_next:

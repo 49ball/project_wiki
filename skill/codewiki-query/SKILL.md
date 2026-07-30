@@ -5,8 +5,18 @@ description: Use when the user asks a question about how the code works, what so
 
 # codewiki query — 위키와 색인으로 질문에 답한다
 
-**툴킷 위치**: 기본 `~/codewiki/cw.py`. 없으면 사용자에게 물어라.
-이하 `CW="python3 ~/codewiki/cw.py"`.
+**툴킷 위치**: 대상 저장소의 `CLAUDE.md` 나 `AGENTS.md` 에 `codewiki:begin`
+블록이 있으면 **거기에 정확한 경로와 프로젝트 경로가 적혀 있다. 찾지 마라.**
+없으면 기본 `~/codewiki/cw.py`, 그것도 없으면 사용자에게 물어라.
+
+셸에서는 **함수로 정의해서 쓴다.** `CW="python3 ..."` 형태는 zsh 에서 단어
+분리가 안 돼 실패한다.
+
+```bash
+cw() { python3 <툴킷경로>/cw.py "$@"; }
+```
+
+이하 `$CW` 는 이 `cw` 함수를 뜻한다.
 
 ## 절차
 
